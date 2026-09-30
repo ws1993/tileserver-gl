@@ -16,15 +16,22 @@ Example:
         "sprites": "sprites",
         "icons": "icons",
         "styles": "styles",
-        "mbtiles": ""
+        "mbtiles": "data",
+        "pmtiles": "data",
+        "files": "files"
       },
       "domains": [
         "localhost:8080",
         "127.0.0.1:8080"
       ],
-      "formatQuality": {
-        "jpeg": 80,
-        "webp": 90
+      "allowedHosts": "localhost,myapp.example.com",
+      "formatOptions": {
+        "jpeg": {
+          "quality": 80
+        },
+        "webp": {
+          "quality": 90
+        }
       },
       "maxScaleFactor": 3,
       "maxSize": 2048,
@@ -33,6 +40,8 @@ Example:
       "serveAllStyles": false,
       "serveStaticMaps": true,
       "allowRemoteMarkerIcons": true,
+      "allowInlineMarkerImages": true,
+      "staticAttributionText": "© OpenMapTiles  © OpenStreetMaps",
       "tileMargin": 0
     },
     "styles": {
@@ -49,6 +58,9 @@ Example:
         "tilejson": {
           "format": "webp"
         }
+      },
+      "remote": {
+        "style": "https://demotiles.maplibre.org/style.json"
       }
     },
     "data": {
@@ -82,10 +94,24 @@ Path to the html (relative to ``root`` path) to use as a front page.
 Use ``true`` (or nothing) to serve the default TileServer GL front page with list of styles and data.
 Use ``false`` to disable the front page altogether (404).
 
-``formatQuality``
+``formatOptions``
 -----------------
 
-Quality of the compression of individual image formats. [0-100]
+You can use this to specify options for the generation of images in the supported file formats.
+For WebP, the only supported option is ``quality`` [0-100].
+For JPEG, the only supported options are ``quality`` [0-100] and ``progressive`` [true, false]. 
+For PNG, the full set of options `exposed by the sharp library <https://sharp.pixelplumbing.com/api-output#png>`_ is available, except ``force`` and ``colours`` (use ``colors``). If not set, their values are the defaults from ``sharp``.
+
+For example::
+
+  "formatOptions": {
+    "png": {
+      "palette": true,
+      "colors": 4
+    }
+  }
+
+Note: ``formatOptions`` replaced the ``formatQuality`` option in previous versions of TileServer GL. 
 
 ``maxScaleFactor``
 -----------
@@ -129,6 +155,19 @@ If you have plenty of memory, try setting these equal to or slightly above your 
 If you need to conserve memory, try lower values for scale factors that are less common.
 Default is ``[16, 8, 4]``.
 
+``pbfAlias``
+------------------------
+
+Some CDNs did not handle .pbf extension as a static file correctly.
+The default URLs (with .pbf) are always available, but an alternative can be set.
+An example extension suffix would be ".pbf.pict".
+
+``serveAllFonts``
+------------------------
+
+If this option is enabled, all the fonts from the ``paths.fonts`` will be served.
+Otherwise only the fonts referenced by available styles will be served.
+
 ``serveAllStyles``
 ------------------------
 
@@ -136,11 +175,30 @@ If this option is enabled, all the styles from the ``paths.styles`` will be serv
 The process will also watch for changes in this directory and remove/add more styles dynamically.
 It is recommended to also use the ``serveAllFonts`` option when using this option.
 
+``leafletRetina``
+------------------------
+
+If this option is enabled, the Leaflet raster map viewer will attempt to fetch high-resolution (Retina, ``@2x``) tiles for high-DPI displays.
+Disable this if you want to reduce CPU/memory load and bandwidth when users are primarily utilizing the basic raster map viewer.
+Default is ``false``.
+
+``serveStaticMaps``
+------------------------
+
+If this option is enabled, all the static map endpoints will be served.
+Default is ``true``.
+
 ``watermark``
 -----------
 
-Optional string to be rendered into the raster tiles (and static maps) as watermark (bottom-left corner).
-Can be used for hard-coding attributions etc. (can also be specified per-style).
+Optional string to be rendered into the raster tiles and static maps as watermark (bottom-left corner).
+Not used by default.
+
+``staticAttributionText``
+-----------
+
+Optional string to be rendered in the static images endpoint. Text will be rendered in the bottom-right corner,
+and styled similar to attribution on web-based maps (text only, links not supported).
 Not used by default.
 
 ``allowRemoteMarkerIcons``
@@ -150,12 +208,54 @@ Allows the rendering of marker icons fetched via http(s) hyperlinks.
 For security reasons only allow this if you can control the origins from where the markers are fetched!
 Default is to disallow fetching of icons from remote sources.
 
+``allowInlineMarkerImages``
+--------------
+Allows the rendering of inline marker icons or base64 urls.
+For security reasons only allow this if you can control the origins from where the markers are fetched!
+Not used by default.
+
+``dataDecorator``
+-----------------
+
+Path (relative to ``root``) to a JavaScript module whose default export is called to modify tile data and TileJSON on the fly. Not used by default.
+
+The module must be an ES module with a default export. The function is called as ``decorate(id, type, data, z, x, y)`` and **must return the value**, modified or not - returning nothing discards the data.
+
+The function may be ``async``, or return a promise. The return value is awaited, so the decorator can do asynchronous work such as a lookup or a fetch. It is awaited on every call, including once per tile for ``'data'``, so keep it fast or cache inside the module.
+
+``id``
+  The data source id from the config, or the source name from the style.
+
+``type``
+  Either ``'tilejson'`` or ``'data'``.
+
+``data``
+  For ``'tilejson'``, the TileJSON object served at ``/data/{id}.json``, or a style's local source object. For ``'data'``, a ``Buffer`` of vector tile bytes, already un-gzipped.
+
+``z``, ``x``, ``y``
+  Tile coordinates. Only passed for ``'data'``.
+
+``'data'`` is called for vector (pbf) sources only, both for ``/data/{id}/{z}/{x}/{y}.pbf`` and for the tiles fed to the raster renderer. Raster tiles are never passed through it.
+
+.. code-block:: js
+
+  // decorator.js
+  export default function (id, type, data, z, x, y) {
+    if (type === 'tilejson') {
+      data.attribution = 'Example attribution';
+    }
+    return data;
+  }
+
+Errors loading the module are logged and the server starts without a decorator, so check the startup output if it does not appear to run.
+
+
 ``styles``
 ==========
 
 Each item in this object defines one style (map). It can have the following options:
 
-* ``style`` -- name of the style json file [required]
+* ``style`` -- name of the style json file or url of a remote hosted style [required]
 * ``serve_rendered`` -- whether to render the raster tiles for this style or not
 * ``serve_data`` -- whether to allow access to the original tiles, sprites and required glyphs
 * ``tilejson`` -- properties to add to the TileJSON created for the raster data
@@ -165,11 +265,121 @@ Each item in this object defines one style (map). It can have the following opti
 ``data``
 ========
 
-Each item specifies one data source which should be made accessible by the server. It has the following options:
+Each item specifies one data source which should be made accessible by the server. It has to have one of the following options:
 
-* ``mbtiles`` -- name of the mbtiles file [required]
+* ``mbtiles`` -- name of the mbtiles file
+* ``pmtiles`` -- name of the pmtiles file, url, or S3 path.
 
-The mbtiles file does not need to be specified here unless you explicitly want to serve the raw data.
+For example::
+
+  "data": {
+    "source1": {
+      "mbtiles": "source1.mbtiles"
+    },
+    "source2": {
+      "pmtiles": "source2.pmtiles"
+    },
+    "source3": {
+      "pmtiles": "https://foo.lan/source3.pmtiles"
+    },
+    "source4": {
+      "pmtiles": "s3://my-bucket/tiles/terrain.pmtiles"
+    }
+  }
+
+The data source does not need to be specified here unless you explicitly want to serve the raw data.
+
+Data Source Options
+--------------
+
+Within the top-level ``data`` object in your configuration, each defined data source (e.g., `terrain`, `vector_tiles`) can have several key properties. These properties define how *tileserver-gl* processes and serves the tiles from that source.
+
+For example::
+
+  "data": {
+    "terrain": {
+      "mbtiles": "terrain1.mbtiles",
+      "encoding": "mapbox",
+      "tileSize": 512
+    },
+    "vector_tiles": {
+      "pmtiles": "custom_osm.pmtiles"
+    },
+    "production-s3-tiles": {
+      "pmtiles": "s3://prod-bucket/tiles.pmtiles",
+      "s3Profile": "production"
+    }
+  }
+
+Here are the available options for each data source:
+
+``encoding`` (string)
+    Applicable to terrain tiles. Configures the expected encoding of the terrain data.
+    Setting this to ``mapbox`` or ``terrarium`` enables a terrain preview mode and the ``elevation`` API for the ``data`` endpoint (if applicable to the source).
+
+``tileSize`` (integer)
+    Specifies the expected pixel dimensions of the tiles within this data source.
+    This option is crucial if your source data uses 512x512 pixel tiles, as *tileserver-gl* typically assumes 256x256 by default.
+    Allowed values: ``256``, ``512``.
+    Default: ``256``.
+
+``sparse`` (boolean)
+    Controls behavior when a tile is not found in the source.
+
+    * ``true`` - Returns HTTP 404, allowing clients like MapLibre to overzoom and use parent tiles. Use this for terrain or datasets with uneven zoom coverage.
+    * ``false`` - Returns HTTP 204 (No Content), signaling an intentionally empty tile and preventing overzoom.
+
+    Resolved from the first of these that is set, highest priority first:
+
+    1. ``sparse`` on the data source in this config file
+    2. ``sparse`` in the top-level ``options``
+    3. ``sparse`` in the archive's own metadata (the MBTiles ``metadata`` table, or the PMTiles metadata JSON)
+    4. The tile format - ``false`` for vector tiles (pbf), ``true`` for raster tiles (png, webp, jpg, etc.)
+
+    Config outranks archive metadata, so a source that declares the wrong value for your deployment can be corrected without rewriting the file. MBTiles metadata values are text; ``"true"``/``"false"`` and ``"1"``/``"0"`` are both understood, and anything else is ignored rather than guessed at.
+
+``s3Profile`` (string)
+    Specifies the AWS credential profile to use for S3 PMTiles sources. The profile must be defined in your ``~/.aws/credentials`` file.
+    This is useful when you need to access multiple S3 buckets with different credentials.
+    Alternatively, you can specify the profile in the URL using ``?profile=profile-name``.
+    If both are specified, the configuration ``s3Profile`` takes precedence.
+    Optional, only applicable to PMTiles sources using S3 URLs.
+
+``requestPayer`` (boolean)
+    Enables support for "requester pays" S3 buckets where the requester (not the bucket owner) pays for data transfer costs.
+    Set to ``true`` if accessing a requester pays bucket.
+    Can be specified in the URL using ``?requestPayer=true`` or in the configuration.
+    If both are specified, the configuration value takes precedence.
+    Default: ``false``.
+    Optional, only applicable to PMTiles sources using S3 URLs.
+
+``s3Region`` (string)
+    Specifies the AWS region for the S3 bucket.
+    Important for optimizing performance and reducing data transfer costs when accessing AWS S3 buckets.
+    Can be specified in the URL using ``?region=region-name`` or in the configuration.
+    If both are specified, the configuration value takes precedence.
+    If not specified, uses ``AWS_REGION`` environment variable or defaults to ``us-east-1``.
+    Optional, only applicable to PMTiles sources using S3 URLs.
+
+``s3UrlFormat`` (string)
+    Specifies how to interpret the S3 URL format.
+    
+    Allowed values:
+    
+    * ``aws`` - Interpret as AWS S3 (``s3://bucket/path/file.pmtiles``)
+    * ``custom`` - Interpret as custom S3 endpoint (``s3://endpoint/bucket/path/file.pmtiles``)
+    * Not specified (default) - Auto-detect based on URL pattern
+    
+    Can be specified in the URL using ``?s3UrlFormat=aws`` or in the configuration.
+    If both are specified, the configuration value takes precedence.
+    
+    Optional, only applicable to PMTiles sources using S3 URLs.
+
+.. note::
+    By default, URLs with dots in the first segment (e.g., ``s3://storage.example.com/bucket/file.pmtiles``) are treated as custom endpoints, while URLs without dots are treated as AWS S3. Use ``s3UrlFormat: "aws"`` if your AWS bucket name contains dots.
+
+.. note::
+    These configuration options will be overridden by metadata in the MBTiles or PMTiles file. if corresponding properties exist in the file's metadata, you do not need to specify them in the data configuration.
 
 Referencing local files from style JSON
 =======================================
@@ -179,21 +389,195 @@ You can link various data sources from the style JSON (for example even remote T
 MBTiles
 -------
 
-To specify that you want to use local mbtiles, use to following syntax: ``mbtiles://switzerland.mbtiles``.
-The TileServer-GL will try to find the file ``switzerland.mbtiles`` in ``root`` + ``mbtiles`` path.
+To specify that you want to use local mbtiles, use to following syntax: ``mbtiles://source1.mbtiles``.
+TileServer-GL will try to find the file ``source1.mbtiles`` in ``root`` + ``mbtiles`` path.
 
 For example::
 
   "sources": {
     "source1": {
-      "url": "mbtiles://switzerland.mbtiles",
+      "url": "mbtiles://source1.mbtiles",
       "type": "vector"
     }
   }
 
-Alternatively, you can use ``mbtiles://{zurich-vector}`` to reference existing data object from the config.
-In this case, the server will look into the ``config.json`` to determine what mbtiles file to use.
-For the config above, this is equivalent to ``mbtiles://zurich.mbtiles``.
+Alternatively, you can use ``mbtiles://{source1}`` to reference existing data object from the config.
+In this case, the server will look into the ``config.json`` to determine what file to use by data id.
+For the config above, this is equivalent to ``mbtiles://source1.mbtiles``.
+
+PMTiles
+-------
+
+To specify that you want to use local pmtiles, use to following syntax: ``pmtiles://source2.pmtiles``.
+TileServer-GL will try to find the file ``source2.pmtiles`` in ``root`` + ``pmtiles`` path.
+
+To specify that you want to use a url based pmtiles, use to following syntax: ``pmtiles://https://foo.lan/source3.pmtiles``.
+
+For example::
+
+  "sources": {
+    "source2": {
+      "url": "pmtiles://source2.pmtiles",
+      "type": "vector"
+    },
+    "source3": {
+      "url": "pmtiles://https://foo.lan/source3.pmtiles",
+      "type": "vector"
+    }
+  }
+
+Alternatively, you can use ``pmtiles://{source2}`` to reference existing data object from the config.
+In this case, the server will look into the ``config.json`` to determine what file to use by data id.
+For the config above, this is equivalent to ``pmtiles://source2.pmtiles``.
+
+S3 and S3-Compatible Storage
+-----------------------------
+
+PMTiles files can be accessed directly from AWS S3 or S3-compatible storage services (such as Contabo, DigitalOcean Spaces, MinIO, etc.) using S3 URLs. This provides better performance and eliminates HTTP rate limiting issues.
+
+**Supported URL Formats:**
+
+1. **AWS S3 (default):**
+   ``s3://bucket-name/path/to/file.pmtiles``
+
+2. **S3-compatible storage with custom endpoint:**
+   ``s3://endpoint-url/bucket-name/path/to/file.pmtiles``
+
+**AWS Credentials:**
+
+S3 sources require AWS credentials to be configured. The server will automatically use credentials from:
+
+* Environment variables: ``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``, ``AWS_REGION``
+* AWS credentials file: ``~/.aws/credentials`` on Linux/macOS or ``C:\Users\USERNAME\.aws\credentials`` on Windows
+* IAM role (when running on AWS EC2, ECS, or Lambda)
+
+For S3-compatible storage providers, use the same AWS credential format with your provider's access keys.
+
+Example using environment variables::
+
+  export AWS_ACCESS_KEY_ID=your_access_key
+  export AWS_SECRET_ACCESS_KEY=your_secret_key
+  export AWS_REGION=us-west-2
+
+**Multiple AWS Credential Profiles:**
+
+If you need to access S3 buckets with different credentials, you can use AWS credential profiles. Profiles are defined in your AWS credentials file (``~/.aws/credentials`` on Linux/macOS or ``C:\Users\USERNAME\.aws\credentials`` on Windows)::
+
+  [default]
+  aws_access_key_id=YOUR_DEFAULT_KEY
+  aws_secret_access_key=YOUR_DEFAULT_SECRET
+
+  [production]
+  aws_access_key_id=YOUR_PRODUCTION_KEY
+  aws_secret_access_key=YOUR_PRODUCTION_SECRET
+
+  [staging]
+  aws_access_key_id=YOUR_STAGING_KEY
+  aws_secret_access_key=YOUR_STAGING_SECRET
+
+**S3 Configuration Options (Main Config Data Section):**
+
+When configuring S3 sources in the main configuration file's ``data`` section, you can use URL query parameters or configuration properties. Configuration properties take precedence over URL parameters.
+
+*Profile* - Specifies which AWS credential profile to use::
+
+  # URL parameter
+  "pmtiles": "s3://bucket/tiles.pmtiles?profile=production"
+  
+  # Configuration property
+  "pmtiles": "s3://bucket/tiles.pmtiles",
+  "s3Profile": "production"
+
+Precedence order (highest to lowest): Configuration property ``s3Profile``, URL parameter ``?profile=...``, default AWS credential chain.
+
+*Region* - Specifies the AWS region (important for performance and cost optimization)::
+
+  # URL parameter
+  "pmtiles": "s3://bucket/tiles.pmtiles?region=us-west-2"
+  
+  # Configuration property
+  "pmtiles": "s3://bucket/tiles.pmtiles",
+  "s3Region": "us-west-2"
+
+Precedence order (highest to lowest): Configuration property ``s3Region``, URL parameter ``?region=...``, Environment variable ``AWS_REGION``, Default: ``us-east-1``.
+
+*RequestPayer* - Enables "requester pays" buckets where you pay for data transfer::
+
+  # URL parameter
+  "pmtiles": "s3://bucket/tiles.pmtiles?requestPayer=true"
+  
+  # Configuration property
+  "pmtiles": "s3://bucket/tiles.pmtiles",
+  "requestPayer": true
+
+Precedence order (highest to lowest): Configuration property ``requestPayer``, URL parameter ``?requestPayer=true``, Default: ``false``.
+
+*S3UrlFormat* - Specifies how to interpret S3 URLs::
+
+  # URL parameter
+  "pmtiles": "s3://my.bucket.name/tiles.pmtiles?s3UrlFormat=aws"
+  
+  # Configuration property
+  "pmtiles": "s3://my.bucket.name/tiles.pmtiles",
+  "s3UrlFormat": "aws"
+
+Precedence order (highest to lowest): Configuration property ``s3UrlFormat``, URL parameter ``?s3UrlFormat=...``, Auto-detection.
+
+**Complete Configuration Examples:**
+
+Using URL parameters::
+
+  "data": {
+    "us-west-tiles": {
+      "pmtiles": "s3://prod-bucket/tiles.pmtiles?profile=production&region=us-west-2"
+    },
+    "dotted-bucket-name": {
+      "pmtiles": "s3://my.bucket.name/tiles.pmtiles?s3UrlFormat=aws&region=us-east-1"
+    },
+    "eu-requester-pays": {
+      "pmtiles": "s3://bucket/tiles.pmtiles?profile=prod&region=eu-central-1&requestPayer=true"
+    }
+  }
+
+Using configuration properties (recommended)::
+
+  "data": {
+    "us-west-tiles": {
+      "pmtiles": "s3://prod-bucket/tiles.pmtiles",
+      "s3Profile": "production",
+      "s3Region": "us-west-2"
+    },
+    "dotted-bucket-name": {
+      "pmtiles": "s3://my.bucket.name/tiles.pmtiles",
+      "s3UrlFormat": "aws",
+      "s3Region": "us-east-1"
+    },
+    "eu-requester-pays": {
+      "pmtiles": "s3://bucket/tiles.pmtiles",
+      "s3Profile": "production",
+      "s3Region": "eu-central-1",
+      "requestPayer": true
+    }
+  }
+
+**Using S3 in Style JSON Sources:**
+
+When referencing S3 sources from within a style JSON file, use the ``pmtiles://`` prefix with S3 URLs. You can specify profile, region, requestPayer, and s3UrlFormat using URL query parameters (configuration properties are not available in style JSON)::
+
+  "sources": {
+    "aws-tiles": {
+      "url": "pmtiles://s3://my-bucket/tiles.pmtiles?profile=production",
+      "type": "vector"
+    },
+    "dotted-bucket": {
+      "url": "pmtiles://s3://my.bucket.name/tiles.pmtiles?s3UrlFormat=aws",
+      "type": "vector"
+    },
+    "spaces-tiles": {
+      "url": "pmtiles://s3://example-storage.com/my-bucket/tiles.pmtiles?region=nyc3",
+      "type": "vector"
+    }
+  }
 
 Sprites
 -------
@@ -223,3 +607,23 @@ It should contain the following placeholders:
 * ``{range}`` -- range of the glyphs
 
 For example ``"glyphs": "{fontstack}/{range}.pbf"`` will instruct TileServer-GL to look for the files such as ``fonts/Open Sans/0-255.pbf`` (``fonts`` come from the ``paths`` property of the ``config.json`` example above).
+
+``allowedHosts``
+----------------
+
+Mitigates Host header poisoning (HNP) by restricting which hosts may appear in absolute URLs returned by the server. If set, only the specified hosts (case-insensitive, comma-separated) are allowed; otherwise, path-only URLs are returned when the request host is not in the list. Default is ``*`` (no restriction).
+
+You can set this option in your config file:
+
+.. code-block:: json
+
+  {
+    "options": {
+      "allowedHosts": "localhost,myapp.example.com"
+      // ...other options...
+    }
+  }
+
+If unset or set to ``*``, behavior is unchanged and all hosts are accepted. For production, set ``allowedHosts`` to your known host(s) or use ``public_url`` for a fixed base URL. This option can also be set via the ``TILESERVER_GL_ALLOWED_HOSTS`` environment variable, but config file takes priority if both are set.
+
+See also: ``public_url`` option and security documentation.

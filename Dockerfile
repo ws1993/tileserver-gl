@@ -1,75 +1,104 @@
-FROM ubuntu:focal AS builder
+# Use Ubuntu 24.04 (Noble) as the base
+FROM ubuntu:noble AS builder
 
 ENV NODE_ENV="production"
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN set -ex; \
-    export DEBIAN_FRONTEND=noninteractive; \
-    apt-get -qq update; \
-    apt-get -y --no-install-recommends install \
+RUN export DEBIAN_FRONTEND=noninteractive && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends --no-install-suggests \
       build-essential \
+      python3-setuptools \
       ca-certificates \
-      wget \
+      curl \
+      gnupg \
       pkg-config \
       xvfb \
       libglfw3-dev \
       libuv1-dev \
-      libjpeg-turbo8 \
-      libicu66 \
       libcairo2-dev \
       libpango1.0-dev \
+      libpng-dev \
       libjpeg-dev \
       libgif-dev \
       librsvg2-dev \
       libcurl4-openssl-dev \
-      libpixman-1-dev; \
-    wget -qO- https://deb.nodesource.com/setup_16.x | bash; \
-    apt-get install -y nodejs; \
-    apt-get -y remove wget; \
-    apt-get -y --purge autoremove; \
-    apt-get clean; \
-    rm -rf /var/lib/apt/lists/*;
+      libicu-dev && \
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends --no-install-suggests nodejs && \
+    npm i -g npm@latest && \
+    apt-get -y remove curl gnupg && \
+    apt-get -y --purge autoremove && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /usr/src/app
-COPY package* /usr/src/app/
 
-RUN cd /usr/src/app && npm ci --omit=dev
+WORKDIR /usr/src/app
 
-FROM ubuntu:focal AS final
+COPY package.json package-lock.json ./
+
+RUN npm config set fetch-retries 5 && \
+    npm config set fetch-retry-mintimeout 100000 && \
+    npm config set fetch-retry-maxtimeout 600000 && \
+    npm ci --omit=dev && \
+    # Build canvas from source for the Noble architecture
+    npm_config_build_from_source=true npm rebuild canvas && \
+    chown -R root:root /usr/src/app
+
+# --- Final Stage ---
+FROM ubuntu:noble AS final
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN export DEBIAN_FRONTEND=noninteractive && \
+    groupadd -r node && \
+    useradd -r -g node node && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends --no-install-suggests \
+      ca-certificates \
+      curl \
+      gnupg \
+      xvfb \
+      libglfw3 \
+      libuv1 \
+      libicu74 \
+      libcairo2 \
+      libjpeg-turbo8 \
+      libgif7 \
+      libpng16-16t64 \
+      libopengl0 \
+      libcurl4 \
+      librsvg2-dev \
+      libpango-1.0-0 \
+      libjemalloc2 && \
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends --no-install-suggests nodejs && \
+    npm i -g npm@latest && \
+    # Create appropriate symlinks if needed
+    ln -sf "$(find /usr -name "libjemalloc.so*" | head -n 1)" /usr/lib/libjemalloc.so && \
+    apt-get -y remove curl gnupg && \
+    apt-get -y --purge autoremove && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /home/node/.aws && \
+    chown -R node:node /home/node
 
 ENV \
     NODE_ENV="production" \
     CHOKIDAR_USEPOLLING=1 \
-    CHOKIDAR_INTERVAL=500
-
-RUN set -ex; \
-    export DEBIAN_FRONTEND=noninteractive; \
-    groupadd -r node; \
-    useradd -r -g node node; \
-    apt-get -qq update; \
-    apt-get -y --no-install-recommends install \
-      ca-certificates \
-      wget \
-      xvfb \
-      libglfw3 \
-      libuv1 \
-      libjpeg-turbo8 \
-      libicu66 \
-      libcairo2 \
-      libgif7 \
-      libopengl0 \
-      libpixman-1-0 \
-      libcurl4 \
-      librsvg2-2 \
-      libpango1.0; \
-    wget -qO- https://deb.nodesource.com/setup_16.x | bash; \
-    apt-get install -y nodejs; \
-    apt-get -y remove wget; \
-    apt-get -y --purge autoremove; \
-    apt-get clean; \
-    rm -rf /var/lib/apt/lists/*;
+    CHOKIDAR_INTERVAL=500 \
+    LD_PRELOAD="/usr/lib/libjemalloc.so" \
+    MALLOC_CONF="background_thread:true,metadata_thp:auto,dirty_decay_ms:5000,muzzy_decay_ms:5000"
 
 COPY --from=builder /usr/src/app /usr/src/app
-
 COPY . /usr/src/app
 
 RUN mkdir -p /data && chown node:node /data

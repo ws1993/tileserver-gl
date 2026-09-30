@@ -11,67 +11,54 @@ Just run ``docker run --rm -it -v $(pwd):/data -p 8080:8080 maptiler/tileserver-
 
 Additional options (see :doc:`/usage`) can be passed to the TileServer GL by appending them to the end of this command. You can, for example, do the following:
 
-* ``docker run ... maptiler/tileserver-gl --mbtiles my-tiles.mbtiles`` -- explicitly specify which mbtiles to use (if you have more in the folder)
+* ``docker run ... maptiler/tileserver-gl --file my-tiles.mbtiles`` -- explicitly specify which mbtiles to use (if you have more in the folder)
 * ``docker run ... maptiler/tileserver-gl --verbose`` -- to see the default config created automatically
 
 npm
 ===
 
-Just run ``npm install -g tileserver-gl``.
+npm is supported on the following platforms with `Native Dependencies <#id1>`_ installed.
 
+- Operating systems:
+
+  - Ubuntu 24.04 (x64/arm64)
+  - macOS 15 (x64/arm64)
+  - Windows (x64)
+
+- Node.js 20,22,24
+  
+Install globally from npmjs.
+------------------------------
+::
+
+  npm install -g tileserver-gl
+  tileserver-gl
+
+Install locally from source
+-------------------
+::
+
+  git clone https://github.com/maptiler/tileserver-gl.git
+  cd tileserver-gl
+  npm install
+  node .
 
 Native dependencies
 -------------------
 
-There are some native dependencies that you need to make sure are installed if you plan to run the TileServer GL natively without docker.
-The precise package names you need to install may differ on various platforms.
+Ubuntu 24.04 (x64/arm64)
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+- apt install build-essential python3-setuptools pkg-config xvfb libglfw3-dev libuv1-dev libjpeg-turbo8 libicu-dev libcairo2-dev libpango1.0-dev libpng-dev libjpeg-dev libgif-dev librsvg2-dev librsvg2-dev libcurl4-openssl-dev libpixman-1-dev
 
-These are required on Debian 11:
-  * ``libgles2-mesa``
-  * ``libegl1``
-  * ``xvfb``
-  * ``xauth``
-  * ``libopengl0``
-  * ``libcurl4``
-  * ``curl``
-  * ``libuv1-dev``
-  * ``libc6-dev``
-  * ``http://archive.ubuntu.com/ubuntu/pool/main/libj/libjpeg-turbo/libjpeg-turbo8_2.0.3-0ubuntu1_amd64.deb``
-  * ``http://archive.ubuntu.com/ubuntu/pool/main/i/icu/libicu66_66.1-2ubuntu2_amd64.deb``
+MacOS 15 (x64/arm64)
+~~~~~~~~~~~~~~~~~~~~~~
+- brew install pkg-config cairo pango libpng jpeg giflib librsvg harfbuzz
 
-These are required on Ubuntu 20.04:
-  * ``libcairo2-dev``
-  * ``libjpeg8-dev``
-  * ``libpango1.0-dev``
-  * ``libgif-dev``
-  * ``build-essential``
-  * ``g++``
-  * ``xvfb``
-  * ``libgles2-mesa-dev``
-  * ``libgbm-dev``
-  * ``libxxf86vm-dev``
+Windows (x64)
+~~~~~~~~~~~~~~~~~~~~~~~~~
+- `Microsoft Visual C++ Redistributable <https://aka.ms/vs/17/release/vc_redist.x64.exe>`_
 
 ``tileserver-gl-light`` on npm
 ==============================
 
 Alternatively, you can use ``tileserver-gl-light`` package instead, which is pure javascript (does not have any native dependencies) and can run anywhere, but does not contain rasterization features.
-
-
-From source
-===========
-
-Make sure you have Node v10 (nvm install 10) and run::
-
-  npm install
-  node .
-
-
-On OSX
-======
-
-Make sure to have dependencies of canvas_ package installed::
-
-  brew install pkg-config cairo libpng jpeg giflib
-
-
-.. _canvas: https://www.npmjs.com/package/canvas

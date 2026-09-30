@@ -1,29 +1,79 @@
 'use strict';
 
+// SECTION START
+//
+// The order of the two imports below is important.
+// For an unknown reason, if the order is reversed, rendering can crash.
+// This happens on ARM:
+//  > terminate called after throwing an instance of 'std::runtime_error'
+//  > what():  Cannot read GLX extensions.
+import { Image, createCanvas } from 'canvas';
+import '@maplibre/maplibre-gl-native';
+//
+// SECTION END
+
 import advancedPool from 'advanced-pool';
-import fs from 'node:fs';
 import path from 'path';
 import url from 'url';
-import util from 'util';
-import zlib from 'zlib';
-import sharp from 'sharp'; // sharp has to be required before node-canvas. see https://github.com/lovell/sharp/issues/371
-import { createCanvas, Image } from 'canvas';
+import sharp from 'sharp';
 import clone from 'clone';
 import Color from 'color';
 import express from 'express';
 import sanitize from 'sanitize-filename';
-import SphericalMercator from '@mapbox/sphericalmercator';
+import { SphericalMercator } from '@mapbox/sphericalmercator';
 import mlgl from '@maplibre/maplibre-gl-native';
-import MBTiles from '@mapbox/mbtiles';
+import polyline from '@mapbox/polyline';
 import proj4 from 'proj4';
-import request from 'request';
-import { getFontsPbf, getTileUrls, fixTileJSONCenter } from './utils.js';
+import {
+  allowedScales,
+  allowedTileSizes,
+  getFontsPbf,
+  listFonts,
+  getTileUrls,
+  isValidHttpUrl,
+  isValidRemoteUrl,
+  fixTileJSONCenter,
+  fetchTileData,
+  readFile,
+  parseOptionalBoolean,
+  resolveSparse,
+} from './utils.js';
+import { openPMtiles, getPMtilesInfo } from './pmtiles_adapter.js';
+import { renderOverlay, renderWatermark, renderAttribution } from './render.js';
+import { getMapLibreRenderZoom } from './render_mode.js';
+import fsp from 'node:fs/promises';
+import { existsP, gunzipP } from './promises.js';
+import { openMbTilesWrapper } from './mbtiles_wrapper.js';
+import { parse as secureParse } from 'secure-json-parse';
 
-const FLOAT_PATTERN = '[+-]?(?:\\d+|\\d+.?\\d+)';
-const httpTester = /^(http(s)?:)?\/\//;
+const FLOAT_PATTERN = '[+-]?(?:\\d+|\\d*\\.\\d+)';
+
+const staticTypeRegex = new RegExp(
+  `^` +
+    `(?:` +
+    // Format 1: {lon},{lat},{zoom}[@{bearing}[,{pitch}]]
+    `(?<lon>${FLOAT_PATTERN}),(?<lat>${FLOAT_PATTERN}),(?<zoom>${FLOAT_PATTERN})` +
+    `(?:@(?<bearing>${FLOAT_PATTERN})(?:,(?<pitch>${FLOAT_PATTERN}))?)?` +
+    `|` +
+    // Format 2: {minx},{miny},{maxx},{maxy}
+    `(?<minx>${FLOAT_PATTERN}),(?<miny>${FLOAT_PATTERN}),(?<maxx>${FLOAT_PATTERN}),(?<maxy>${FLOAT_PATTERN})` +
+    `|` +
+    // Format 3: auto
+    `(?<auto>auto)` +
+    `)` +
+    `$`,
+);
+
+const PATH_PATTERN =
+  /^((fill|stroke|width|border|borderwidth):[^|]+\|)*(enc:.+|-?\d+(\.\d*)?,-?\d+(\.\d*)?(\|-?\d+(\.\d*)?,-?\d+(\.\d*)?)+)/;
 
 const mercator = new SphericalMercator();
-const getScale = (scale) => (scale || '@1x').slice(1, 2) | 0;
+
+// Consecutive failed renders per renderer. A single render error is usually a
+// style or tile problem, but a renderer that keeps failing is itself broken and
+// has to be replaced.
+const rendererFailures = new WeakMap();
+const MAX_CONSECUTIVE_RENDER_FAILURES = 3;
 
 mlgl.on('message', (e) => {
   if (e.severity === 'WARNING' || e.severity === 'ERROR') {
@@ -51,10 +101,10 @@ const cachedEmptyResponses = {
 
 /**
  * Create an appropriate mlgl response for http errors.
- *
  * @param {string} format The format (a sharp format or 'pbf').
  * @param {string} color The background color (or empty string for transparent).
- * @param {Function} callback The mlgl callback.
+ * @param {(err: Error|null, data: object|null) => void} callback The mlgl callback.
+ * @returns {void}
  */
 function createEmptyResponse(format, color, callback) {
   if (!format || format === 'pbf') {
@@ -70,6 +120,7 @@ function createEmptyResponse(format, color, callback) {
   }
 
   const cacheKey = `${format},${color}`;
+  // eslint-disable-next-line security/detect-object-injection -- cacheKey is constructed from validated format and color
   const data = cachedEmptyResponses[cacheKey];
   if (data) {
     callback(null, { data: data });
@@ -77,34 +128,103 @@ function createEmptyResponse(format, color, callback) {
   }
 
   // create an "empty" response image
-  color = new Color(color);
-  const array = color.array();
-  const channels = array.length === 4 && format !== 'jpeg' ? 4 : 3;
-  sharp(Buffer.from(array), {
-    raw: {
-      width: 1,
-      height: 1,
-      channels: channels,
-    },
-  })
-    .toFormat(format)
-    .toBuffer((err, buffer, info) => {
-      if (!err) {
+  try {
+    color = new Color(color);
+    const array = color.array();
+    const channels = array.length === 4 && format !== 'jpeg' ? 4 : 3;
+    sharp(Buffer.from(array), {
+      raw: {
+        width: 1,
+        height: 1,
+        channels,
+      },
+    })
+      .toFormat(format)
+      .toBuffer((err, buffer, info) => {
+        if (err) {
+          console.error('Error creating image with Sharp:', err);
+          callback(err, null);
+          return;
+        }
+        // eslint-disable-next-line security/detect-object-injection -- cacheKey is constructed from validated format and color
         cachedEmptyResponses[cacheKey] = buffer;
+        callback(null, { data: buffer });
+      });
+  } catch (error) {
+    console.error('Error during image processing setup:', error);
+    callback(error, null);
+  }
+}
+
+const ALLOW_STATIC_PARAMS = new Set([
+  'path',
+  'marker',
+  'latlng',
+  'padding',
+  'maxzoom',
+  'fill',
+  'stroke',
+  'width',
+  'linecap',
+  'linejoin',
+  'border',
+  'borderwidth',
+]);
+
+/**
+ * Merges query and body into a null-prototype object.
+ * Accumulates multiple values for the same key into arrays for a lossless merge.
+ * @param {object} query Request query parameters.
+ * @param {object} body Request body parameters.
+ * @returns {object} The merged parameters.
+ */
+export function getSecureMergedParams(query, body) {
+  const result = Object.create(null);
+
+  const accumulate = (source) => {
+    if (!source) return;
+    if (typeof source !== 'object' || Array.isArray(source))
+      throw new Error(`Invalid data.`);
+
+    for (const [key, value] of Object.entries(source)) {
+      if (!ALLOW_STATIC_PARAMS.has(key)) {
+        continue;
       }
-      callback(null, { data: buffer });
-    });
+
+      const isPrimitive = value === null || typeof value !== 'object';
+      const isPrimitiveArray =
+        Array.isArray(value) &&
+        value.every((v) => v === null || typeof v !== 'object');
+
+      if (!isPrimitive && !isPrimitiveArray)
+        throw new Error(
+          `Invalid value type for key "${key}": nested objects are not allowed.`,
+        );
+
+      const ensureArray = (v) => (Array.isArray(v) ? v : [v]);
+      if (key in result) {
+        // eslint-disable-next-line security/detect-object-injection -- result is a null-prototype object; key is from validated source
+        result[key] = ensureArray(result[key]).concat(ensureArray(value));
+      } else {
+        // eslint-disable-next-line security/detect-object-injection -- result is a null-prototype object; key is from validated source
+        result[key] = value;
+      }
+    }
+  };
+
+  accumulate(query);
+  accumulate(body);
+  return result;
 }
 
 /**
  * Parses coordinate pair provided to pair of floats and ensures the resulting
  * pair is a longitude/latitude combination depending on lnglat query parameter.
- *
- * @param {List} coordinatePair Coordinate pair.
- * @param coordinates
+ * @param {Array<string>} coordinates Coordinate pair.
  * @param {object} query Request query parameters.
+ * @returns {Array<number>|null} Parsed coordinate pair as [longitude, latitude] or null if invalid
  */
-const parseCoordinatePair = (coordinates, query) => {
+function parseCoordinatePair(coordinates, query) {
   const firstCoordinate = parseFloat(coordinates[0]);
   const secondCoordinate = parseFloat(coordinates[1]);
 
@@ -114,94 +234,136 @@ const parseCoordinatePair = (coordinates, query) => {
   }
 
   // Check if coordinates have been provided as lat/lng pair instead of the
-  // ususal lng/lat pair and ensure resulting pair is lng/lat
+  // usual lng/lat pair and ensure resulting pair is lng/lat
   if (query.latlng === '1' || query.latlng === 'true') {
     return [secondCoordinate, firstCoordinate];
   }
 
   return [firstCoordinate, secondCoordinate];
-};
+}
 
 /**
  * Parses a coordinate pair from query arguments and optionally transforms it.
- *
- * @param {List} coordinatePair Coordinate pair.
+ * @param {Array<string>} coordinatePair Coordinate pair.
  * @param {object} query Request query parameters.
- * @param {Function} transformer Optional transform function.
+ * @param {((coords: Array<number>) => Array<number>)|null} transformer Optional transform function.
+ * @returns {Array<number>|null} Transformed coordinate pair or null if invalid.
  */
-const parseCoordinates = (coordinatePair, query, transformer) => {
+function parseCoordinates(coordinatePair, query, transformer) {
   const parsedCoordinates = parseCoordinatePair(coordinatePair, query);
+
+  if (!parsedCoordinates) {
+    return null;
+  }
 
   // Transform coordinates
   if (transformer) {
-    return transformer(parsedCoordinates);
+    try {
+      return transformer(parsedCoordinates);
+    } catch (error) {
+      console.error('Error transforming coordinates:', error);
+      return null;
+    }
   }
 
   return parsedCoordinates;
-};
+}
 
 /**
  * Parses paths provided via query into a list of path objects.
- *
  * @param {object} query Request query parameters.
- * @param {Function} transformer Optional transform function.
+ * @param {((coords: Array<number>) => Array<number>)|null} transformer Optional transform function.
+ * @returns {Array<Array<Array<number>>>} Array of paths.
  */
-const extractPathsFromQuery = (query, transformer) => {
-  // Return an empty list if no paths have been provided
-  if (!query.path) {
-    return [];
-  }
-
+function extractPathsFromQuery(query, transformer) {
+  // Initiate paths array
   const paths = [];
+  // Return an empty list if no paths have been provided
+  if ('path' in query && !query.path) {
+    return paths;
+  }
+  // Parse paths provided via path query argument
+  if ('path' in query) {
+    const providedPaths = Array.isArray(query.path) ? query.path : [query.path];
+    // Iterate through paths, parse and validate them
+    for (const providedPath of providedPaths) {
+      let geometryString = providedPath;
 
-  // Check if multiple paths have been provided and mimic a list if it's a
-  // single path.
-  const providedPaths = Array.isArray(query.path) ? query.path : [query.path];
-
-  // Iterate through paths, parse and validate them
-  for (const provided_path of providedPaths) {
-    const currentPath = [];
-
-    // Extract coordinate-list from path
-    const pathParts = (provided_path || '').split('|');
-
-    // Iterate through coordinate-list, parse the coordinates and validate them
-    for (const pair of pathParts) {
-      // Extract coordinates from coordinate pair
-      const pairParts = pair.split(',');
-
-      // Ensure we have two coordinates
-      if (pairParts.length === 2) {
-        const pair = parseCoordinates(pairParts, query, transformer);
-
-        // Ensure coordinates could be parsed and skip them if not
-        if (pair === null) {
+      // Logic to strip style options (like stroke:red) from the front
+      const parts = providedPath.split('|');
+      let firstGeometryIndex = 0;
+      for (const [index, part] of parts.entries()) {
+        // A part is considered a style option if it contains ':' but is NOT an 'enc:' string or a coordinate
+        if (part.includes(':') && !part.startsWith('enc:')) {
+          // This is a style option, continue
           continue;
+        } else {
+          // This is the start of the geometry (enc: or coordinate)
+          firstGeometryIndex = index;
+          break;
         }
-
-        // Add the coordinate-pair to the current path if they are valid
-        currentPath.push(pair);
       }
-    }
 
-    // Extend list of paths with current path if it contains coordinates
-    if (currentPath.length) {
-      paths.push(currentPath);
+      // If we found a geometry, set the geometryString to the rest of the path
+      if (firstGeometryIndex > 0) {
+        geometryString = parts.slice(firstGeometryIndex).join('|');
+      }
+
+      // Logic for pushing coords to path when path includes google polyline
+      if (
+        geometryString.includes('enc:') &&
+        PATH_PATTERN.test(geometryString)
+      ) {
+        // +4 because 'enc:' is 4 characters, everything after 'enc:' is considered to be part of the polyline
+        const encIndex = geometryString.indexOf('enc:') + 4;
+        const coords = polyline
+          .decode(geometryString.substring(encIndex))
+          .map(([lat, lng]) => [lng, lat]);
+        paths.push(coords);
+      } else {
+        // Iterate through paths, parse and validate them
+        const currentPath = [];
+
+        // Extract coordinate-list from path
+        const pathParts = (geometryString || '').split('|');
+
+        // Iterate through coordinate-list, parse the coordinates and validate them
+        for (const pair of pathParts) {
+          // Extract coordinates from coordinate pair
+          const pairParts = pair.split(',');
+          // Ensure we have two coordinates
+          if (pairParts.length === 2) {
+            const pair = parseCoordinates(pairParts, query, transformer);
+
+            // Ensure coordinates could be parsed and skip them if not
+            if (pair === null) {
+              continue;
+            }
+
+            // Add the coordinate-pair to the current path if they are valid
+            currentPath.push(pair);
+          }
+        }
+        // Extend list of paths with current path if it contains coordinates
+        if (currentPath.length) {
+          paths.push(currentPath);
+        }
+      }
     }
   }
   return paths;
-};
+}
 
 /**
  * Parses marker options provided via query and sets corresponding attributes
  * on marker object.
  * Options adhere to the following format
  * [optionName]:[optionValue]
- *
- * @param {List[String]} optionsList List of option strings.
+ * @param {Array<string>} optionsList List of option strings.
  * @param {object} marker Marker object to configure.
+ * @returns {void}
  */
-const parseMarkerOptions = (optionsList, marker) => {
+function parseMarkerOptions(optionsList, marker) {
   for (const options of optionsList) {
     const optionParts = options.split(':');
     // Ensure we got an option name and value
@@ -211,33 +373,50 @@ const parseMarkerOptions = (optionsList, marker) => {
 
     switch (optionParts[0]) {
       // Scale factor to up- or downscale icon
-      case 'scale':
-        // Scale factors must not be negative
-        marker.scale = Math.abs(parseFloat(optionParts[1]));
-        break;
-      // Icon offset as positive or negative pixel value in the following
-      // format [offsetX],[offsetY] where [offsetY] is optional
-      case 'offset':
-        const providedOffset = optionParts[1].split(',');
-        // Set X-axis offset
-        marker.offsetX = parseFloat(providedOffset[0]);
-        // Check if an offset has been provided for Y-axis
-        if (providedOffset.length > 1) {
-          marker.offsetY = parseFloat(providedOffset[1]);
+      case 'scale': {
+        // Scale factors must not be negative and should have reasonable bounds
+        const scale = parseFloat(optionParts[1]);
+        if (!isNaN(scale) && scale > 0 && scale < 10) {
+          marker.scale = scale;
+        } else {
+          console.warn(`Invalid marker scale: ${optionParts[1]}`);
         }
         break;
+      }
+      // Icon offset as positive or negative pixel value in the following
+      // format [offsetX],[offsetY] where [offsetY] is optional
+      case 'offset': {
+        const providedOffset = optionParts[1].split(',');
+        const offsetX = parseFloat(providedOffset[0]);
+
+        // Set X-axis offset
+        if (!isNaN(offsetX) && Math.abs(offsetX) < 1000) {
+          marker.offsetX = offsetX;
+        }
+
+        // Check if an offset has been provided for Y-axis
+        if (providedOffset.length > 1) {
+          const offsetY = parseFloat(providedOffset[1]);
+          if (!isNaN(offsetY) && Math.abs(offsetY) < 1000) {
+            marker.offsetY = offsetY;
+          }
+        }
+        break;
+      }
+      default:
+        console.warn(`Unknown marker option: ${optionParts[0]}`);
     }
   }
-};
+}
 
 /**
  * Parses markers provided via query into a list of marker objects.
- *
  * @param {object} query Request query parameters.
  * @param {object} options Configuration options.
- * @param {Function} transformer Optional transform function.
+ * @param {((coords: Array<number>) => Array<number>)|null} transformer Optional transform function.
+ * @returns {Array<object>} An array of marker objects.
  */
-const extractMarkersFromQuery = (query, options, transformer) => {
+function extractMarkersFromQuery(query, options, transformer) {
   // Return an empty list if no markers have been provided
   if (!query.marker) {
     return [];
@@ -246,58 +425,73 @@ const extractMarkersFromQuery = (query, options, transformer) => {
   const markers = [];
 
   // Check if multiple markers have been provided and mimic a list if it's a
-  // single maker.
+  // single marker.
   const providedMarkers = Array.isArray(query.marker)
     ? query.marker
     : [query.marker];
 
-  // Iterate through provided markers which can have one of the following
-  // formats
-  // [location]|[pathToFileTelativeToConfiguredIconPath]
+  // Iterate through provided markers which can have one of the following formats:
+  // [location]|[pathToFileRelativeToConfiguredIconPath]
   // [location]|[pathToFile...]|[option]|[option]|...
   for (const providedMarker of providedMarkers) {
+    if (typeof providedMarker !== 'string') {
+      continue;
+    }
+
     const markerParts = providedMarker.split('|');
+
     // Ensure we got at least a location and an icon uri
     if (markerParts.length < 2) {
+      console.warn('Marker requires at least location and icon path');
       continue;
     }
 
     const locationParts = markerParts[0].split(',');
+
     // Ensure the locationParts contains two items
     if (locationParts.length !== 2) {
+      console.warn('Marker location must have exactly 2 coordinates');
       continue;
     }
 
     let iconURI = markerParts[1];
     // Check if icon is served via http otherwise marker icons are expected to
     // be provided as filepaths relative to configured icon path
-    if (!(iconURI.startsWith('http://') || iconURI.startsWith('https://'))) {
+    const isRemoteURL = isValidHttpUrl(iconURI);
+    const isDataURL = iconURI.startsWith('data:');
+    if (!(isRemoteURL || isDataURL)) {
       // Sanitize URI with sanitize-filename
       // https://www.npmjs.com/package/sanitize-filename#details
       iconURI = sanitize(iconURI);
 
       // If the selected icon is not part of available icons skip it
       if (!options.paths.availableIcons.includes(iconURI)) {
+        console.warn(`Icon not in available icons: ${iconURI}`);
         continue;
       }
 
       iconURI = path.resolve(options.paths.icons, iconURI);
 
       // When we encounter a remote icon check if the configuration explicitly allows them.
-    } else if (options.allowRemoteMarkerIcons !== true) {
+    } else if (isRemoteURL && options.allowRemoteMarkerIcons !== true) {
+      console.warn('Remote marker icons not allowed');
+      continue;
+    } else if (isDataURL && options.allowInlineMarkerImages !== true) {
+      console.warn('Inline marker images not allowed');
       continue;
     }
 
     // Ensure marker location could be parsed
     const location = parseCoordinates(locationParts, query, transformer);
     if (location === null) {
+      console.warn('Failed to parse marker location');
       continue;
     }
 
-    const marker = {};
-
-    marker.location = location;
-    marker.icon = iconURI;
+    const marker = {
+      location,
+      icon: iconURI,
+    };
 
     // Check if options have been provided
     if (markerParts.length > 2) {
@@ -308,234 +502,16 @@ const extractMarkersFromQuery = (query, options, transformer) => {
     markers.push(marker);
   }
   return markers;
-};
-
+}
 /**
- * Transforms coordinates to pixels.
- *
- * @param {List[Number]} ll Longitude/Latitude coordinate pair.
- * @param {number} zoom Map zoom level.
- */
-const precisePx = (ll, zoom) => {
-  const px = mercator.px(ll, 20);
-  const scale = Math.pow(2, zoom - 20);
-  return [px[0] * scale, px[1] * scale];
-};
-
-/**
- * Draws a marker in cavans context.
- *
- * @param {object} ctx Canvas context object.
- * @param {object} marker Marker object parsed by extractMarkersFromQuery.
- * @param {number} z Map zoom level.
- */
-const drawMarker = (ctx, marker, z) => {
-  return new Promise((resolve) => {
-    const img = new Image();
-    const pixelCoords = precisePx(marker.location, z);
-
-    const getMarkerCoordinates = (imageWidth, imageHeight, scale) => {
-      // Images are placed with their top-left corner at the provided location
-      // within the canvas but we expect icons to be centered and above it.
-
-      // Substract half of the images width from the x-coordinate to center
-      // the image in relation to the provided location
-      let xCoordinate = pixelCoords[0] - imageWidth / 2;
-      // Substract the images height from the y-coordinate to place it above
-      // the provided location
-      let yCoordinate = pixelCoords[1] - imageHeight;
-
-      // Since image placement is dependent on the size offsets have to be
-      // scaled as well. Additionally offsets are provided as either positive or
-      // negative values so we always add them
-      if (marker.offsetX) {
-        xCoordinate = xCoordinate + marker.offsetX * scale;
-      }
-      if (marker.offsetY) {
-        yCoordinate = yCoordinate + marker.offsetY * scale;
-      }
-
-      return {
-        x: xCoordinate,
-        y: yCoordinate,
-      };
-    };
-
-    const drawOnCanvas = () => {
-      // Check if the images should be resized before beeing drawn
-      const defaultScale = 1;
-      const scale = marker.scale ? marker.scale : defaultScale;
-
-      // Calculate scaled image sizes
-      const imageWidth = img.width * scale;
-      const imageHeight = img.height * scale;
-
-      // Pass the desired sizes to get correlating coordinates
-      const coords = getMarkerCoordinates(imageWidth, imageHeight, scale);
-
-      // Draw the image on canvas
-      if (scale != defaultScale) {
-        ctx.drawImage(img, coords.x, coords.y, imageWidth, imageHeight);
-      } else {
-        ctx.drawImage(img, coords.x, coords.y);
-      }
-      // Resolve the promise when image has been drawn
-      resolve();
-    };
-
-    img.onload = drawOnCanvas;
-    img.onerror = (err) => {
-      throw err;
-    };
-    img.src = marker.icon;
-  });
-};
-
-/**
- * Draws a list of markers onto a canvas.
- * Wraps drawing of markers into list of promises and awaits them.
- * It's required because images are expected to load asynchronous in canvas js
- * even when provided from a local disk.
- *
- * @param {object} ctx Canvas context object.
- * @param {List[Object]} markers Marker objects parsed by extractMarkersFromQuery.
- * @param {number} z Map zoom level.
- */
-const drawMarkers = async (ctx, markers, z) => {
-  const markerPromises = [];
-
-  for (const marker of markers) {
-    // Begin drawing marker
-    markerPromises.push(drawMarker(ctx, marker, z));
-  }
-
-  // Await marker drawings before continuing
-  await Promise.all(markerPromises);
-};
-
-/**
- * Draws a list of coordinates onto a canvas and styles the resulting path.
- *
- * @param {object} ctx Canvas context object.
- * @param {List[Number]} path List of coordinates.
+ * Calculates the zoom level for a given bounding box.
+ * @param {Array<number>} bbox Bounding box as [minx, miny, maxx, maxy].
+ * @param {number} w Width of the image.
+ * @param {number} h Height of the image.
  * @param {object} query Request query parameters.
- * @param {number} z Map zoom level.
+ * @returns {number} Calculated zoom level.
  */
-const drawPath = (ctx, path, query, z) => {
-  if (!path || path.length < 2) {
-    return null;
-  }
-
-  ctx.beginPath();
-
-  // Transform coordinates to pixel on canvas and draw lines between points
-  for (const pair of path) {
-    const px = precisePx(pair, z);
-    ctx.lineTo(px[0], px[1]);
-  }
-
-  // Check if first coordinate matches last coordinate
-  if (
-    path[0][0] === path[path.length - 1][0] &&
-    path[0][1] === path[path.length - 1][1]
-  ) {
-    ctx.closePath();
-  }
-
-  // Optionally fill drawn shape with a rgba color from query
-  if (query.fill !== undefined) {
-    ctx.fillStyle = query.fill;
-    ctx.fill();
-  }
-
-  // Get line width from query and fall back to 1 if not provided
-  const lineWidth = query.width !== undefined ? parseFloat(query.width) : 1;
-
-  // Ensure line width is valid
-  if (lineWidth > 0) {
-    // Get border width from query and fall back to 10% of line width
-    const borderWidth =
-      query.borderwidth !== undefined
-        ? parseFloat(query.borderwidth)
-        : lineWidth * 0.1;
-
-    // Set rendering style for the start and end points of the path
-    // https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/lineCap
-    ctx.lineCap = query.linecap || 'butt';
-
-    // Set rendering style for overlapping segments of the path with differing directions
-    // https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/lineJoin
-    ctx.lineJoin = query.linejoin || 'miter';
-
-    // In order to simulate a border we draw the path two times with the first
-    // beeing the wider border part.
-    if (query.border !== undefined && borderWidth > 0) {
-      // We need to double the desired border width and add it to the line width
-      // in order to get the desired border on each side of the line.
-      ctx.lineWidth = lineWidth + borderWidth * 2;
-      // Set border style as rgba
-      ctx.strokeStyle = query.border;
-      ctx.stroke();
-    }
-
-    ctx.lineWidth = lineWidth;
-    ctx.strokeStyle = query.stroke || 'rgba(0,64,255,0.7)';
-    ctx.stroke();
-  }
-};
-
-const renderOverlay = async (
-  z,
-  x,
-  y,
-  bearing,
-  pitch,
-  w,
-  h,
-  scale,
-  paths,
-  markers,
-  query,
-) => {
-  if ((!paths || paths.length === 0) && (!markers || markers.length === 0)) {
-    return null;
-  }
-
-  const center = precisePx([x, y], z);
-
-  const mapHeight = 512 * (1 << z);
-  const maxEdge = center[1] + h / 2;
-  const minEdge = center[1] - h / 2;
-  if (maxEdge > mapHeight) {
-    center[1] -= maxEdge - mapHeight;
-  } else if (minEdge < 0) {
-    center[1] -= minEdge;
-  }
-
-  const canvas = createCanvas(scale * w, scale * h);
-  const ctx = canvas.getContext('2d');
-  ctx.scale(scale, scale);
-  if (bearing) {
-    ctx.translate(w / 2, h / 2);
-    ctx.rotate((-bearing / 180) * Math.PI);
-    ctx.translate(-center[0], -center[1]);
-  } else {
-    // optimized path
-    ctx.translate(-center[0] + w / 2, -center[1] + h / 2);
-  }
-
-  // Draw provided paths if any
-  for (const path of paths) {
-    drawPath(ctx, path, query, z);
-  }
-
-  // Await drawing of markers before rendering the canvas
-  await drawMarkers(ctx, markers, z);
-
-  return canvas.toBuffer();
-};
-
-const calcZForBBox = (bbox, w, h, query) => {
+function calcZForBBox(bbox, w, h, query) {
   let z = 25;
 
   const padding = query.padding !== undefined ? parseFloat(query.padding) : 0.1;
@@ -554,648 +530,996 @@ const calcZForBBox = (bbox, w, h, query) => {
   z = Math.max(Math.log(Math.max(w, h) / 256) / Math.LN2, Math.min(25, z));
 
   return z;
-};
+}
 
-const existingFonts = {};
-let maxScaleFactor = 2;
+/**
+ * Responds with an image.
+ * @param {object} options Configuration options.
+ * @param {object} item Item object containing map and other information.
+ * @param {number} z Zoom level.
+ * @param {number} lon Longitude of the center.
+ * @param {number} lat Latitude of the center.
+ * @param {number} bearing Map bearing.
+ * @param {number} pitch Map pitch.
+ * @param {number} width Width of the image.
+ * @param {number} height Height of the image.
+ * @param {number} scale Scale factor.
+ * @param {string} format Image format.
+ * @param {object} res Express response object.
+ * @param {Buffer|null} overlay Optional overlay image.
+ * @param {string} mode Rendering mode ('tile' or 'static').
+ * @param {string|null} id Style or dataset ID for metrics labeling.
+ * @returns {Promise<void>}
+ */
+async function respondImage(
+  options,
+  item,
+  z,
+  lon,
+  lat,
+  bearing,
+  pitch,
+  width,
+  height,
+  scale,
+  format,
+  res,
+  overlay = null,
+  mode = 'tile',
+  id = null,
+) {
+  if (
+    Math.abs(lon) > 180 ||
+    Math.abs(lat) > 85.06 ||
+    lon !== lon ||
+    lat !== lat
+  ) {
+    return res.status(400).send('Invalid center');
+  }
 
-export const serve_rendered = {
-  init: (options, repo) => {
-    const fontListingPromise = new Promise((resolve, reject) => {
-      fs.readdir(options.paths.fonts, (err, files) => {
-        if (err) {
-          reject(err);
-          return;
+  if (
+    Math.min(width, height) <= 0 ||
+    Math.max(width, height) * scale > (options.maxSize || 2048) ||
+    width !== width ||
+    height !== height
+  ) {
+    return res.status(400).send('Invalid size');
+  }
+
+  if (format === 'png' || format === 'webp') {
+    /* empty */
+  } else if (format === 'jpg' || format === 'jpeg') {
+    format = 'jpeg';
+  } else {
+    return res.status(400).send('Invalid format');
+  }
+
+  const tileMargin = Math.max(options.tileMargin || 0, 0);
+  let pool;
+  if (mode === 'tile' && tileMargin === 0) {
+    // eslint-disable-next-line security/detect-object-injection -- scale is validated by allowedScales
+    pool = item.map.renderers[scale];
+  } else {
+    // eslint-disable-next-line security/detect-object-injection -- scale is validated by allowedScales
+    pool = item.map.renderersStatic[scale];
+  }
+
+  if (!pool) {
+    console.error(`Pool not found for scale ${scale}, mode ${mode}`);
+    return res.status(500).send('Renderer pool not configured');
+  }
+
+  pool.acquire(async (err, renderer) => {
+    const renderStart = process.hrtime.bigint();
+    // Check if pool.acquire failed or returned null/invalid renderer
+    if (err) {
+      console.error('Failed to acquire renderer from pool:', err);
+      if (!res.headersSent) {
+        if (metricsModule) {
+          metricsModule.tileErrorsTotal.inc({ type: 'rendered', name: id });
         }
-        for (const file of files) {
-          fs.stat(path.join(options.paths.fonts, file), (err, stats) => {
-            if (err) {
-              reject(err);
-              return;
-            }
-            if (stats.isDirectory()) {
-              existingFonts[path.basename(file)] = true;
-            }
-          });
-        }
-        resolve();
-      });
-    });
-
-    maxScaleFactor = Math.min(Math.floor(options.maxScaleFactor || 3), 9);
-    let scalePattern = '';
-    for (let i = 2; i <= maxScaleFactor; i++) {
-      scalePattern += i.toFixed();
+        return res.status(503).send('Renderer pool error');
+      }
+      return;
     }
-    scalePattern = `@[${scalePattern}]x`;
 
-    const app = express().disable('x-powered-by');
+    // Hand the renderer back to the pool exactly once. A renderer that is
+    // neither released nor removed stays in the pool's busy list forever, so the
+    // pool shrinks and a replacement mlgl.Map is built to take its place.
+    let returned = false;
+    const releaseRenderer = () => {
+      if (returned) {
+        return;
+      }
+      returned = true;
+      try {
+        pool.release(renderer);
+      } catch (e) {
+        console.error('Error releasing renderer:', e);
+      }
+    };
+    const discardRenderer = (reason) => {
+      if (returned) {
+        return;
+      }
+      returned = true;
+      console.error(`Discarding renderer: ${reason}`);
+      try {
+        pool.removeBadObject(renderer);
+      } catch (e) {
+        console.error('Error removing bad renderer:', e);
+      }
+    };
 
-    const respondImage = (
-      item,
-      z,
-      lon,
-      lat,
+    if (!renderer) {
+      console.error(
+        'Renderer is null - likely crashed or failed to initialize',
+      );
+      discardRenderer('renderer is null');
+      if (!res.headersSent) {
+        if (metricsModule) {
+          metricsModule.tileErrorsTotal.inc({ type: 'rendered', name: id });
+        }
+        return res.status(503).send('Renderer unavailable');
+      }
+      return;
+    }
+
+    // Validate renderer has required methods (basic health check)
+    if (typeof renderer.render !== 'function') {
+      discardRenderer('missing render method');
+      if (!res.headersSent) {
+        if (metricsModule) {
+          metricsModule.tileErrorsTotal.inc({ type: 'rendered', name: id });
+        }
+        return res.status(503).send('Renderer invalid');
+      }
+      return;
+    }
+
+    const mlglZ = getMapLibreRenderZoom(z, width, mode);
+
+    const params = {
+      zoom: mlglZ,
+      center: [lon, lat],
       bearing,
       pitch,
       width,
       height,
-      scale,
-      format,
-      res,
-      next,
-      opt_overlay,
-      opt_mode = 'tile',
-    ) => {
-      if (
-        Math.abs(lon) > 180 ||
-        Math.abs(lat) > 85.06 ||
-        lon !== lon ||
-        lat !== lat
-      ) {
-        return res.status(400).send('Invalid center');
-      }
-      if (
-        Math.min(width, height) <= 0 ||
-        Math.max(width, height) * scale > (options.maxSize || 2048) ||
-        width !== width ||
-        height !== height
-      ) {
-        return res.status(400).send('Invalid size');
-      }
-      if (format === 'png' || format === 'webp') {
-      } else if (format === 'jpg' || format === 'jpeg') {
-        format = 'jpeg';
-      } else {
-        return res.status(400).send('Invalid format');
-      }
+    };
 
-      let pool;
-      if (opt_mode === 'tile') {
-        pool = item.map.renderers[scale];
-      } else {
-        pool = item.map.renderers_static[scale];
+    // HACK(Part 1) 256px tiles are a zoom level lower than maplibre-native default tiles. this hack allows tileserver-gl to support zoom 0 256px tiles, which would actually be zoom -1 in maplibre-native. Since zoom -1 isn't supported, a double sized zoom 0 tile is requested and resized in Part 2.
+    if (z === 0 && width === 256) {
+      params.width *= 2;
+      params.height *= 2;
+    }
+    // END HACK(Part 1)
+
+    if (z > 0 && tileMargin > 0) {
+      params.width += tileMargin * 2;
+      params.height += tileMargin * 2;
+    }
+
+    // Set a timeout for the render operation to detect hung renderers
+    const renderTimeout = setTimeout(() => {
+      discardRenderer('render timed out - renderer is hung');
+
+      if (!res.headersSent) {
+        res.status(503).send('Renderer timeout');
       }
-      pool.acquire((err, renderer) => {
-        const mlglZ = Math.max(0, z - 1);
-        const params = {
-          zoom: mlglZ,
-          center: [lon, lat],
-          bearing: bearing,
-          pitch: pitch,
-          width: width,
-          height: height,
-        };
-        if (z === 0) {
-          params.width *= 2;
-          params.height *= 2;
+    }, 30000); // 30 second timeout
+
+    try {
+      renderer.render(params, (err, data) => {
+        clearTimeout(renderTimeout);
+
+        if (res.headersSent) {
+          // The timeout already fired and answered the request. It discarded
+          // the renderer, so this is a no-op unless some other path responded.
+          releaseRenderer();
+          return;
         }
 
-        const tileMargin = Math.max(options.tileMargin || 0, 0);
-        if (z > 2 && tileMargin > 0) {
-          params.width += tileMargin * 2;
-          params.height += tileMargin * 2;
-        }
-
-        renderer.render(params, (err, data) => {
-          pool.release(renderer);
-          if (err) {
-            console.error(err);
+        if (err) {
+          // Keep a renderer that hit a one-off error: discarding on every
+          // failure churns mlgl.Map instances for what is usually a style or
+          // tile problem. Replace it only once it fails repeatedly.
+          console.error('Render error:', err);
+          const failures = (rendererFailures.get(renderer) || 0) + 1;
+          rendererFailures.set(renderer, failures);
+          if (failures >= MAX_CONSECUTIVE_RENDER_FAILURES) {
+            discardRenderer(`${failures} consecutive render failures`);
+          } else {
+            releaseRenderer();
+          }
+          if (!res.headersSent) {
+            if (metricsModule) {
+              metricsModule.tileErrorsTotal.inc({ type: 'rendered', name: id });
+            }
             return res
               .status(500)
               .header('Content-Type', 'text/plain')
               .send(err);
           }
+          return;
+        }
 
-          // Fix semi-transparent outlines on raw, premultiplied input
-          // https://github.com/maptiler/tileserver-gl/issues/350#issuecomment-477857040
-          for (let i = 0; i < data.length; i += 4) {
-            const alpha = data[i + 3];
-            const norm = alpha / 255;
-            if (alpha === 0) {
-              data[i] = 0;
-              data[i + 1] = 0;
-              data[i + 2] = 0;
-            } else {
-              data[i] = data[i] / norm;
-              data[i + 1] = data[i + 1] / norm;
-              data[i + 2] = data[i + 2] / norm;
-            }
-          }
+        rendererFailures.delete(renderer);
+        releaseRenderer();
 
-          const image = sharp(data, {
-            raw: {
-              width: params.width * scale,
-              height: params.height * scale,
-              channels: 4,
-            },
+        const image = sharp(data, {
+          raw: {
+            premultiplied: true,
+            width: params.width * scale,
+            height: params.height * scale,
+            channels: 4,
+          },
+        });
+
+        if (z > 0 && tileMargin > 0) {
+          const y = mercator.px(params.center, z)[1];
+          const yoffset = Math.max(
+            Math.min(0, y - 128 - tileMargin),
+            y + 128 + tileMargin - Math.pow(2, z + 8),
+          );
+          image.extract({
+            left: tileMargin * scale,
+            top: (tileMargin + yoffset) * scale,
+            width: width * scale,
+            height: height * scale,
           });
+        }
 
-          if (z > 2 && tileMargin > 0) {
-            const [_, y] = mercator.px(params.center, z);
-            let yoffset = Math.max(
-              Math.min(0, y - 128 - tileMargin),
-              y + 128 + tileMargin - Math.pow(2, z + 8),
-            );
-            image.extract({
-              left: tileMargin * scale,
-              top: (tileMargin + yoffset) * scale,
-              width: width * scale,
-              height: height * scale,
-            });
-          }
+        // HACK(Part 2) 256px tiles are a zoom level lower than maplibre-native default tiles. this hack allows tileserver-gl to support zoom 0 256px tiles, which would actually be zoom -1 in maplibre-native. Since zoom -1 isn't supported, a double sized zoom 0 tile is requested and resized here.
+        if (z === 0 && width === 256) {
+          image.resize(width * scale, height * scale);
+        }
 
-          if (z === 0) {
-            // HACK: when serving zoom 0, resize the 0 tile from 512 to 256
-            image.resize(width * scale, height * scale);
-          }
+        const composites = [];
+        if (overlay) {
+          composites.push({ input: overlay });
+        }
+        if (item.watermark) {
+          const canvas = renderWatermark(width, height, scale, item.watermark);
+          composites.push({ input: canvas.toBuffer() });
+        }
 
-          if (opt_overlay) {
-            image.composite([{ input: opt_overlay }]);
-          }
-          if (item.watermark) {
-            const canvas = createCanvas(scale * width, scale * height);
-            const ctx = canvas.getContext('2d');
-            ctx.scale(scale, scale);
-            ctx.font = '10px sans-serif';
-            ctx.strokeWidth = '1px';
-            ctx.strokeStyle = 'rgba(255,255,255,.4)';
-            ctx.strokeText(item.watermark, 5, height - 5);
-            ctx.fillStyle = 'rgba(0,0,0,.4)';
-            ctx.fillText(item.watermark, 5, height - 5);
+        if (mode === 'static' && item.staticAttributionText) {
+          const canvas = renderAttribution(
+            width,
+            height,
+            scale,
+            item.staticAttributionText,
+          );
+          composites.push({ input: canvas.toBuffer() });
+        }
 
-            image.composite([{ input: canvas.toBuffer() }]);
-          }
+        if (composites.length > 0) {
+          image.composite(composites);
+        }
 
-          const formatQuality = (options.formatQuality || {})[format];
+        // Legacy formatQuality is deprecated but still works
+        const formatQualities = options.formatQuality || {};
+        if (Object.keys(formatQualities).length !== 0) {
+          console.log(
+            'WARNING: The formatQuality option is deprecated and has been replaced with formatOptions. Please see the documentation. The values from formatQuality will be used if a quality setting is not provided via formatOptions.',
+          );
+        }
+        // eslint-disable-next-line security/detect-object-injection -- format is validated above
+        const formatQuality = formatQualities[format];
+        // eslint-disable-next-line security/detect-object-injection -- format is validated above
+        const formatOptions = (options.formatOptions || {})[format] || {};
 
-          if (format === 'png') {
-            image.png({ adaptiveFiltering: false });
-          } else if (format === 'jpeg') {
-            image.jpeg({ quality: formatQuality || 80 });
-          } else if (format === 'webp') {
-            image.webp({ quality: formatQuality || 90 });
-          }
-          image.toBuffer((err, buffer, info) => {
-            if (!buffer) {
-              return res.status(404).send('Not found');
+        if (format === 'png') {
+          image.png({
+            progressive: formatOptions.progressive,
+            compressionLevel: formatOptions.compressionLevel,
+            adaptiveFiltering: formatOptions.adaptiveFiltering,
+            palette: formatOptions.palette,
+            quality: formatOptions.quality,
+            effort: formatOptions.effort,
+            colors: formatOptions.colors,
+            dither: formatOptions.dither,
+          });
+        } else if (format === 'jpeg') {
+          image.jpeg({
+            quality: formatOptions.quality || formatQuality || 80,
+            progressive: formatOptions.progressive,
+          });
+        } else if (format === 'webp') {
+          image.webp({ quality: formatOptions.quality || formatQuality || 90 });
+        }
+
+        image.toBuffer((err, buffer, info) => {
+          if (err || !buffer) {
+            console.error('Sharp error:', err);
+            if (!res.headersSent) {
+              if (metricsModule) {
+                metricsModule.tileErrorsTotal.inc({
+                  type: 'rendered',
+                  name: id,
+                });
+              }
+              return res.status(500).send('Image processing failed');
             }
+            return;
+          }
 
+          if (!res.headersSent) {
+            if (metricsModule) {
+              const renderDurationSec =
+                Number(process.hrtime.bigint() - renderStart) / 1e9;
+              metricsModule.tilesServedTotal.inc({
+                type: 'rendered',
+                name: id,
+              });
+              const zoomLabel =
+                process.env.TILESERVER_GL_METRICS_ZOOM === 'true'
+                  ? String(z)
+                  : 'all';
+              metricsModule.tileRenderDuration.observe(
+                { name: id, zoom: zoomLabel },
+                renderDurationSec,
+              );
+            }
             res.set({
               'Last-Modified': item.lastModified,
               'Content-Type': `image/${format}`,
             });
             return res.status(200).send(buffer);
-          });
+          }
         });
       });
-    };
-
-    app.get(
-      `/:id/:z(\\d+)/:x(\\d+)/:y(\\d+):scale(${scalePattern})?.:format([\\w]+)`,
-      (req, res, next) => {
-        const item = repo[req.params.id];
-        if (!item) {
-          return res.sendStatus(404);
+    } catch (error) {
+      clearTimeout(renderTimeout);
+      console.error('Unexpected error during render:', error);
+      discardRenderer('render call threw');
+      if (!res.headersSent) {
+        if (metricsModule) {
+          metricsModule.tileErrorsTotal.inc({ type: 'rendered', name: id });
         }
+        return res.status(500).send('Render failed');
+      }
+    }
+  });
+}
 
-        const modifiedSince = req.get('if-modified-since');
-        const cc = req.get('cache-control');
-        if (modifiedSince && (!cc || cc.indexOf('no-cache') === -1)) {
-          if (new Date(item.lastModified) <= new Date(modifiedSince)) {
-            return res.sendStatus(304);
-          }
-        }
+/**
+ * Handles requests for tile images.
+ * @param {object} options - Configuration options for the server.
+ * @param {object} repo - The repository object holding style data.
+ * @param {object} req - Express request object.
+ * @param {string} req.params.id - The id of the style.
+ * @param {string} req.params.p1 - The tile size parameter, if available.
+ * @param {string} req.params.p2 - The z parameter.
+ * @param {string} req.params.p3 - The x parameter.
+ * @param {string} req.params.p4 - The y parameter.
+ * @param {string} req.params.scale - The scale parameter.
+ * @param {string} req.params.format - The format of the image.
+ * @param {object} res - Express response object.
+ * @param {object} next - Express next middleware function.
+ * @param {number} maxScaleFactor - The maximum scale factor allowed.
+ * @param {number} defailtTileSize - Default tile size.
+ * @returns {Promise<void>}
+ */
+async function handleTileRequest(
+  options,
+  repo,
+  req,
+  res,
+  next,
+  maxScaleFactor,
+  defailtTileSize,
+) {
+  const {
+    id,
+    p1: tileSize,
+    p2: zParam,
+    p3: xParam,
+    p4: yParam,
+    scale: scaleParam,
+    format,
+  } = req.params;
+  // eslint-disable-next-line security/detect-object-injection -- id is route parameter, validated by Express
+  const item = repo[id];
+  if (!item) {
+    return res.sendStatus(404);
+  }
 
-        const z = req.params.z | 0;
-        const x = req.params.x | 0;
-        const y = req.params.y | 0;
-        const scale = getScale(req.params.scale);
-        const format = req.params.format;
-        if (
-          z < 0 ||
-          x < 0 ||
-          y < 0 ||
-          z > 22 ||
-          x >= Math.pow(2, z) ||
-          y >= Math.pow(2, z)
-        ) {
-          return res.status(404).send('Out of bounds');
-        }
-        const tileSize = 256;
-        const tileCenter = mercator.ll(
-          [
-            ((x + 0.5) / (1 << z)) * (256 << z),
-            ((y + 0.5) / (1 << z)) * (256 << z),
-          ],
-          z,
-        );
-        return respondImage(
-          item,
-          z,
-          tileCenter[0],
-          tileCenter[1],
-          0,
-          0,
-          tileSize,
-          tileSize,
-          scale,
-          format,
-          res,
-          next,
-        );
-      },
-    );
+  const modifiedSince = req.get('if-modified-since');
+  const cc = req.get('cache-control');
+  if (modifiedSince && (!cc || cc.indexOf('no-cache') === -1)) {
+    if (
+      new Date(item.lastModified).getTime() ===
+      new Date(modifiedSince).getTime()
+    ) {
+      return res.sendStatus(304);
+    }
+  }
+  const z = parseFloat(zParam) | 0;
+  const x = parseFloat(xParam) | 0;
+  const y = parseFloat(yParam) | 0;
+  const scale = allowedScales(scaleParam, maxScaleFactor);
 
-    if (options.serveStaticMaps !== false) {
-      const staticPattern = `/:id/static/:raw(raw)?/%s/:width(\\d+)x:height(\\d+):scale(${scalePattern})?.:format([\\w]+)`;
+  let parsedTileSize = parseInt(defailtTileSize, 10);
+  if (tileSize) {
+    parsedTileSize = parseInt(allowedTileSizes(tileSize), 10);
 
-      const centerPattern = util.format(
-        ':x(%s),:y(%s),:z(%s)(@:bearing(%s)(,:pitch(%s))?)?',
-        FLOAT_PATTERN,
-        FLOAT_PATTERN,
-        FLOAT_PATTERN,
-        FLOAT_PATTERN,
-        FLOAT_PATTERN,
-      );
+    if (parsedTileSize == null) {
+      return res.status(400).send('Invalid Tile Size');
+    }
+  }
 
-      app.get(
-        util.format(staticPattern, centerPattern),
-        async (req, res, next) => {
-          const item = repo[req.params.id];
-          if (!item) {
-            return res.sendStatus(404);
-          }
-          const raw = req.params.raw;
-          const z = +req.params.z;
-          let x = +req.params.x;
-          let y = +req.params.y;
-          const bearing = +(req.params.bearing || '0');
-          const pitch = +(req.params.pitch || '0');
-          const w = req.params.width | 0;
-          const h = req.params.height | 0;
-          const scale = getScale(req.params.scale);
-          const format = req.params.format;
+  if (
+    scale == null ||
+    z < 0 ||
+    x < 0 ||
+    y < 0 ||
+    z > 22 ||
+    x >= Math.pow(2, z) ||
+    y >= Math.pow(2, z)
+  ) {
+    return res.status(400).send('Out of bounds');
+  }
 
-          if (z < 0) {
-            return res.status(404).send('Invalid zoom');
-          }
+  const tileCenter = mercator.ll(
+    [((x + 0.5) / (1 << z)) * (256 << z), ((y + 0.5) / (1 << z)) * (256 << z)],
+    z,
+  );
 
-          const transformer = raw
-            ? mercator.inverse.bind(mercator)
-            : item.dataProjWGStoInternalWGS;
+  // prettier-ignore
+  return await respondImage(
+    options, item, z, tileCenter[0], tileCenter[1], 0, 0, parsedTileSize, parsedTileSize, scale, format, res, null, 'tile', id,
+  );
+}
 
-          if (transformer) {
-            const ll = transformer([x, y]);
-            x = ll[0];
-            y = ll[1];
-          }
+/**
+ * Handles requests for static map images.
+ * @param {object} options - Configuration options for the server.
+ * @param {object} repo - The repository object holding style data.
+ * @param {object} req - Express request object.
+ * @param {string} req.params.id - The id of the style.
+ * @param {string} req.params.p2 - The raw or static parameter.
+ * @param {string} req.params.p3 - The staticType parameter.
+ * @param {string} req.params.p4 - The widthAndHeight parameter.
+ * @param {string} req.params.scale - The scale parameter.
+ * @param {string} req.params.format - The format of the image.
+ * @param {object} res - Express response object.
+ * @param {object} next - Express next middleware function.
+ * @param {number} maxScaleFactor - The maximum scale factor allowed.
+ * @returns {Promise<void>}
+ */
+async function handleStaticRequest(
+  options,
+  repo,
+  req,
+  res,
+  next,
+  maxScaleFactor,
+) {
+  const {
+    id,
+    p2: raw,
+    p3: staticType,
+    p4: widthAndHeight,
+    scale: scaleParam,
+    format,
+  } = req.params;
+  // eslint-disable-next-line security/detect-object-injection -- id is route parameter, validated by Express
+  const item = repo[id];
 
-          const paths = extractPathsFromQuery(req.query, transformer);
-          const markers = extractMarkersFromQuery(
-            req.query,
-            options,
-            transformer,
-          );
-          const overlay = await renderOverlay(
-            z,
-            x,
-            y,
-            bearing,
-            pitch,
-            w,
-            h,
-            scale,
-            paths,
-            markers,
-            req.query,
-          );
+  let parsedWidth;
+  let parsedHeight;
+  if (widthAndHeight) {
+    const sizeMatch = widthAndHeight.match(/^(\d+)x(\d+)$/);
+    if (sizeMatch) {
+      const width = parseInt(sizeMatch[1], 10);
+      const height = parseInt(sizeMatch[2], 10);
+      if (
+        isNaN(width) ||
+        isNaN(height) ||
+        width !== parseFloat(sizeMatch[1]) ||
+        height !== parseFloat(sizeMatch[2])
+      ) {
+        return res
+          .status(400)
+          .send('Invalid width or height provided in size parameter');
+      }
+      parsedWidth = width;
+      parsedHeight = height;
+    } else {
+      return res
+        .status(400)
+        .send('Invalid width or height provided in size parameter');
+    }
+  } else {
+    return res
+      .status(400)
+      .send('Invalid width or height provided in size parameter');
+  }
 
-          return respondImage(
-            item,
-            z,
-            x,
-            y,
-            bearing,
-            pitch,
-            w,
-            h,
-            scale,
-            format,
-            res,
-            next,
-            overlay,
-            'static',
-          );
-        },
-      );
+  const scale = allowedScales(scaleParam, maxScaleFactor);
+  let isRaw = raw === 'raw';
 
-      const serveBounds = async (req, res, next) => {
-        const item = repo[req.params.id];
-        if (!item) {
-          return res.sendStatus(404);
-        }
-        const raw = req.params.raw;
-        const bbox = [
-          +req.params.minx,
-          +req.params.miny,
-          +req.params.maxx,
-          +req.params.maxy,
-        ];
-        let center = [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2];
+  const staticTypeMatch = staticType.match(staticTypeRegex);
+  if (!item || !format || !scale || !staticTypeMatch?.groups) {
+    return res.sendStatus(404);
+  }
 
-        const transformer = raw
-          ? mercator.inverse.bind(mercator)
-          : item.dataProjWGStoInternalWGS;
-
-        if (transformer) {
-          const minCorner = transformer(bbox.slice(0, 2));
-          const maxCorner = transformer(bbox.slice(2));
-          bbox[0] = minCorner[0];
-          bbox[1] = minCorner[1];
-          bbox[2] = maxCorner[0];
-          bbox[3] = maxCorner[1];
-          center = transformer(center);
-        }
-
-        const w = req.params.width | 0;
-        const h = req.params.height | 0;
-        const scale = getScale(req.params.scale);
-        const format = req.params.format;
-
-        const z = calcZForBBox(bbox, w, h, req.query);
-        const x = center[0];
-        const y = center[1];
-        const bearing = 0;
-        const pitch = 0;
-
-        const paths = extractPathsFromQuery(req.query, transformer);
-        const markers = extractMarkersFromQuery(
-          req.query,
-          options,
-          transformer,
-        );
-        const overlay = await renderOverlay(
-          z,
-          x,
-          y,
-          bearing,
-          pitch,
-          w,
-          h,
-          scale,
-          paths,
-          markers,
-          req.query,
-        );
-        return respondImage(
-          item,
-          z,
-          x,
-          y,
-          bearing,
-          pitch,
-          w,
-          h,
-          scale,
-          format,
-          res,
-          next,
-          overlay,
-          'static',
-        );
-      };
-
-      const boundsPattern = util.format(
-        ':minx(%s),:miny(%s),:maxx(%s),:maxy(%s)',
-        FLOAT_PATTERN,
-        FLOAT_PATTERN,
-        FLOAT_PATTERN,
-        FLOAT_PATTERN,
-      );
-
-      app.get(util.format(staticPattern, boundsPattern), serveBounds);
-
-      app.get('/:id/static/', (req, res, next) => {
-        for (const key in req.query) {
-          req.query[key.toLowerCase()] = req.query[key];
-        }
-        req.params.raw = true;
-        req.params.format = (req.query.format || 'image/png').split('/').pop();
-        const bbox = (req.query.bbox || '').split(',');
-        req.params.minx = bbox[0];
-        req.params.miny = bbox[1];
-        req.params.maxx = bbox[2];
-        req.params.maxy = bbox[3];
-        req.params.width = req.query.width || '256';
-        req.params.height = req.query.height || '256';
-        if (req.query.scale) {
-          req.params.width /= req.query.scale;
-          req.params.height /= req.query.scale;
-          req.params.scale = `@${req.query.scale}`;
-        }
-
-        return serveBounds(req, res, next);
-      });
-
-      const autoPattern = 'auto';
-
-      app.get(
-        util.format(staticPattern, autoPattern),
-        async (req, res, next) => {
-          const item = repo[req.params.id];
-          if (!item) {
-            return res.sendStatus(404);
-          }
-          const raw = req.params.raw;
-          const w = req.params.width | 0;
-          const h = req.params.height | 0;
-          const bearing = 0;
-          const pitch = 0;
-          const scale = getScale(req.params.scale);
-          const format = req.params.format;
-
-          const transformer = raw
-            ? mercator.inverse.bind(mercator)
-            : item.dataProjWGStoInternalWGS;
-
-          const paths = extractPathsFromQuery(req.query, transformer);
-          const markers = extractMarkersFromQuery(
-            req.query,
-            options,
-            transformer,
-          );
-
-          // Extract coordinates from markers
-          const markerCoordinates = [];
-          for (const marker of markers) {
-            markerCoordinates.push(marker.location);
-          }
-
-          // Create array with coordinates from markers and path
-          const coords = [].concat(paths.flat()).concat(markerCoordinates);
-
-          // Check if we have at least one coordinate to calculate a bounding box
-          if (coords.length < 1) {
-            return res.status(400).send('No coordinates provided');
-          }
-
-          const bbox = [Infinity, Infinity, -Infinity, -Infinity];
-          for (const pair of coords) {
-            bbox[0] = Math.min(bbox[0], pair[0]);
-            bbox[1] = Math.min(bbox[1], pair[1]);
-            bbox[2] = Math.max(bbox[2], pair[0]);
-            bbox[3] = Math.max(bbox[3], pair[1]);
-          }
-
-          const bbox_ = mercator.convert(bbox, '900913');
-          const center = mercator.inverse([
-            (bbox_[0] + bbox_[2]) / 2,
-            (bbox_[1] + bbox_[3]) / 2,
-          ]);
-
-          // Calculate zoom level
-          const maxZoom = parseFloat(req.query.maxzoom);
-          let z = calcZForBBox(bbox, w, h, req.query);
-          if (maxZoom > 0) {
-            z = Math.min(z, maxZoom);
-          }
-
-          const x = center[0];
-          const y = center[1];
-
-          const overlay = await renderOverlay(
-            z,
-            x,
-            y,
-            bearing,
-            pitch,
-            w,
-            h,
-            scale,
-            paths,
-            markers,
-            req.query,
-          );
-
-          return respondImage(
-            item,
-            z,
-            x,
-            y,
-            bearing,
-            pitch,
-            w,
-            h,
-            scale,
-            format,
-            res,
-            next,
-            overlay,
-            'static',
-          );
-        },
-      );
+  if (staticTypeMatch.groups.lon) {
+    // Center Based Static Image
+    const z = parseFloat(staticTypeMatch.groups.zoom) || 0;
+    let x = parseFloat(staticTypeMatch.groups.lon) || 0;
+    let y = parseFloat(staticTypeMatch.groups.lat) || 0;
+    const bearing = parseFloat(staticTypeMatch.groups.bearing) || 0;
+    const pitch = parseInt(staticTypeMatch.groups.pitch) || 0;
+    if (z < 0) {
+      return res.status(404).send('Invalid zoom');
     }
 
-    app.get('/:id.json', (req, res, next) => {
+    const transformer = isRaw
+      ? mercator.inverse.bind(mercator)
+      : item.dataProjWGStoInternalWGS;
+
+    if (transformer) {
+      const ll = transformer([x, y]);
+      x = ll[0];
+      y = ll[1];
+    }
+
+    const paths = extractPathsFromQuery(req.query, transformer);
+    const markers = extractMarkersFromQuery(req.query, options, transformer);
+    // prettier-ignore
+    const overlay = await renderOverlay(
+     z, x, y, bearing, pitch, parsedWidth, parsedHeight, scale, paths, markers, req.query,
+   );
+
+    // prettier-ignore
+    return await respondImage(
+    options, item, z, x, y, bearing, pitch, parsedWidth, parsedHeight, scale, format, res, overlay, 'static', id,
+     );
+  } else if (staticTypeMatch.groups.minx) {
+    // Area Based Static Image
+    const minx = parseFloat(staticTypeMatch.groups.minx) || 0;
+    const miny = parseFloat(staticTypeMatch.groups.miny) || 0;
+    const maxx = parseFloat(staticTypeMatch.groups.maxx) || 0;
+    const maxy = parseFloat(staticTypeMatch.groups.maxy) || 0;
+    const bbox = [minx, miny, maxx, maxy];
+    let center = [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2];
+
+    const transformer = isRaw
+      ? mercator.inverse.bind(mercator)
+      : item.dataProjWGStoInternalWGS;
+
+    if (transformer) {
+      const minCorner = transformer(bbox.slice(0, 2));
+      const maxCorner = transformer(bbox.slice(2));
+      bbox[0] = minCorner[0];
+      bbox[1] = minCorner[1];
+      bbox[2] = maxCorner[0];
+      bbox[3] = maxCorner[1];
+      center = transformer(center);
+    }
+
+    const z = calcZForBBox(bbox, parsedWidth, parsedHeight, req.query);
+    const x = center[0];
+    const y = center[1];
+    const bearing = 0;
+    const pitch = 0;
+
+    const paths = extractPathsFromQuery(req.query, transformer);
+    const markers = extractMarkersFromQuery(req.query, options, transformer);
+    // prettier-ignore
+    const overlay = await renderOverlay(
+      z, x, y, bearing, pitch, parsedWidth, parsedHeight, scale, paths, markers, req.query,
+      );
+
+    // prettier-ignore
+    return await respondImage(
+      options, item, z, x, y, bearing, pitch, parsedWidth, parsedHeight, scale, format, res, overlay, 'static', id,
+     );
+  } else if (staticTypeMatch.groups.auto) {
+    // Area Static Image
+    const bearing = 0;
+    const pitch = 0;
+
+    const transformer = isRaw
+      ? mercator.inverse.bind(mercator)
+      : item.dataProjWGStoInternalWGS;
+
+    const paths = extractPathsFromQuery(req.query, transformer);
+    const markers = extractMarkersFromQuery(req.query, options, transformer);
+
+    // Extract coordinates from markers
+    const markerCoordinates = [];
+    for (const marker of markers) {
+      markerCoordinates.push(marker.location);
+    }
+
+    // Create array with coordinates from markers and path
+    const coords = [].concat(paths.flat()).concat(markerCoordinates);
+
+    // Check if we have at least one coordinate to calculate a bounding box
+    if (coords.length < 1) {
+      return res.status(400).send('No coordinates provided');
+    }
+
+    const bbox = [Infinity, Infinity, -Infinity, -Infinity];
+    for (const pair of coords) {
+      bbox[0] = Math.min(bbox[0], pair[0]);
+      bbox[1] = Math.min(bbox[1], pair[1]);
+      bbox[2] = Math.max(bbox[2], pair[0]);
+      bbox[3] = Math.max(bbox[3], pair[1]);
+    }
+
+    const bbox_ = mercator.convert(bbox, '900913');
+    const center = mercator.inverse([
+      (bbox_[0] + bbox_[2]) / 2,
+      (bbox_[1] + bbox_[3]) / 2,
+    ]);
+
+    // Calculate zoom level
+    const maxZoom = parseFloat(req.query.maxzoom);
+    let z = calcZForBBox(bbox, parsedWidth, parsedHeight, req.query);
+    if (maxZoom > 0) {
+      z = Math.min(z, maxZoom);
+    }
+
+    const x = center[0];
+    const y = center[1];
+
+    // prettier-ignore
+    const overlay = await renderOverlay(
+      z, x, y, bearing, pitch, parsedWidth, parsedHeight, scale, paths, markers, req.query,
+    );
+
+    // prettier-ignore
+    return await respondImage(
+        options, item, z, x, y, bearing, pitch, parsedWidth, parsedHeight, scale, format, res, overlay, 'static', id,
+      );
+  } else {
+    return res.sendStatus(404);
+  }
+}
+const existingFonts = {};
+let maxScaleFactor = 2;
+let metricsModule = null;
+
+export const serve_rendered = {
+  /**
+   * Initializes the serve_rendered module.
+   * @param {object} options Configuration options.
+   * @param {object} repo Repository object.
+   * @param {object} programOpts - An object containing the program options.
+   * @returns {Promise<express.Application>} A promise that resolves to the Express app.
+   */
+  init: async function (options, repo, programOpts) {
+    const {
+      verbose,
+      tileSize: defailtTileSize = 256,
+      allowedHosts,
+    } = programOpts;
+    maxScaleFactor = Math.min(Math.floor(options.maxScaleFactor || 3), 9);
+    const app = express().disable('x-powered-by');
+
+    app.post(`/:id{/:p1}/:p2/:p3/:p4{@:scale}{.:format}`, (req, res, next) => {
+      const { p1, p2 } = req.params;
+      const requestType =
+        (!p1 && p2 === 'static') || (p1 === 'static' && p2 === 'raw')
+          ? 'static'
+          : 'tile';
+
+      if (requestType === 'tile') {
+        return res.status(405).send('Method Not Allowed');
+      }
+      next();
+    });
+    app.use(
+      express.json({
+        limit: '5mb',
+        verify: (req, res, buf) => {
+          try {
+            secureParse(buf.toString());
+          } catch (err) {
+            const error = new Error(
+              `Invalid JSON or forbidden key detected: ${err.message}`,
+            );
+            error.status = 400;
+            throw error;
+          }
+        },
+      }),
+    );
+
+    app.use((req, res, next) => {
+      if (req.method === 'POST' && req.body) {
+        try {
+          const merged = getSecureMergedParams(req.query, req.body);
+          Object.defineProperty(req, 'query', {
+            value: merged,
+            configurable: true,
+            enumerable: true,
+            writable: true,
+          });
+        } catch (err) {
+          return res.status(400).send(err.message);
+        }
+      }
+      next();
+    });
+
+    const renderHandler = async (req, res, next) => {
+      try {
+        const { p1, p2, id, p3, p4, scale, format } = req.params;
+        const requestType =
+          (!p1 && p2 === 'static') || (p1 === 'static' && p2 === 'raw')
+            ? 'static'
+            : 'tile';
+
+        if (verbose >= 3) {
+          console.log(
+            `Handling rendered %s request for: /styles/%s%s/%s/%s/%s%s.%s`,
+            requestType,
+            String(id).replace(/\n|\r/g, ''),
+            p1 ? '/' + String(p1).replace(/\n|\r/g, '') : '',
+            String(p2).replace(/\n|\r/g, ''),
+            String(p3).replace(/\n|\r/g, ''),
+            String(p4).replace(/\n|\r/g, ''),
+            scale ? '@' + String(scale).replace(/\n|\r/g, '') : '',
+            String(format).replace(/\n|\r/g, ''),
+          );
+        }
+
+        if (requestType === 'static') {
+          if (options.serveStaticMaps !== false) {
+            return handleStaticRequest(
+              options,
+              repo,
+              req,
+              res,
+              next,
+              maxScaleFactor,
+            );
+          }
+          return res.sendStatus(404);
+        }
+
+        return handleTileRequest(
+          options,
+          repo,
+          req,
+          res,
+          next,
+          maxScaleFactor,
+          defailtTileSize,
+        );
+      } catch (e) {
+        console.log(e);
+        return next(e);
+      }
+    };
+
+    // Bind both GET and POST to the main handler
+    const routePattern = `/:id{/:p1}/:p2/:p3/:p4{@:scale}{.:format}`;
+    app.get(routePattern, renderHandler);
+    app.post(routePattern, renderHandler);
+
+    /**
+     * Handles requests for rendered tilejson endpoint.
+     * @param {object} req - Express request object.
+     * @param {object} res - Express response object.
+     * @param {object} next - Express next middleware function.
+     * @param {string} req.params.id - The id of the tilejson
+     * @param {string} [req.params.tileSize] - The size of the tile, if specified.
+     * @returns {void}
+     */
+    app.get('{/:tileSize}/:id.json', (req, res, next) => {
       const item = repo[req.params.id];
       if (!item) {
         return res.sendStatus(404);
       }
+      const tileSize = parseInt(req.params.tileSize, 10) || undefined;
+      if (verbose >= 3) {
+        console.log(
+          `Handling rendered tilejson request for: /styles/%s%s.json`,
+          req.params.tileSize
+            ? String(req.params.tileSize).replace(/\n|\r/g, '') + '/'
+            : '',
+          String(req.params.id).replace(/\n|\r/g, ''),
+        );
+      }
       const info = clone(item.tileJSON);
+      info.tileSize = tileSize != undefined ? tileSize : 256;
       info.tiles = getTileUrls(
         req,
         info.tiles,
         `styles/${req.params.id}`,
+        tileSize,
         info.format,
         item.publicUrl,
+        undefined,
+        allowedHosts,
       );
       return res.send(info);
     });
 
-    return Promise.all([fontListingPromise]).then(() => app);
+    const fonts = await listFonts(options.paths.fonts);
+    Object.assign(existingFonts, fonts);
+    return app;
   },
-  add: (options, repo, params, id, publicUrl, dataResolver) => {
+  /**
+   * Adds a new item to the repository.
+   * @param {object} options Configuration options.
+   * @param {object} repo Repository object.
+   * @param {object} params Parameters object.
+   * @param {string} id ID of the item.
+   * @param {object} programOpts - An object containing the program options
+   * @param {object} style pre-fetched/read StyleJSON object.
+   * @param {(dataId: string) => object} dataResolver Function to resolve data.
+   * @returns {Promise<void>}
+   */
+  add: async function (
+    options,
+    repo,
+    params,
+    id,
+    programOpts,
+    style,
+    dataResolver,
+  ) {
     const map = {
       renderers: [],
-      renderers_static: [],
+      renderersStatic: [],
       sources: {},
+      sourceTypes: {},
+      sparseFlags: {},
     };
 
-    let styleJSON;
+    const { publicUrl, verbose, fetchTimeout } = programOpts;
+
+    // Cache metrics module if enabled (avoids per-request dynamic imports).
+    // Guard prevents re-importing per style added. Safe because tests verify before production.
+    if (programOpts.metrics && !metricsModule) {
+      const m = await import('./metrics.js');
+      metricsModule = m;
+    }
+
+    const styleJSON = clone(style);
+
+    /**
+     * Creates a pool of renderers.
+     * @param {number} ratio Pixel ratio
+     * @param {string} mode Rendering mode ('tile' or 'static').
+     * @param {number} min Minimum pool size.
+     * @param {number} max Maximum pool size.
+     * @returns {object} The created pool
+     */
     const createPool = (ratio, mode, min, max) => {
+      /**
+       * Creates a renderer
+       * @param {number} ratio Pixel ratio
+       * @param {(err: Error|null, renderer: object) => void} createCallback Function that returns the renderer when created
+       * @returns {void}
+       */
       const createRenderer = (ratio, createCallback) => {
         const renderer = new mlgl.Map({
-          mode: mode,
-          ratio: ratio,
-          request: (req, callback) => {
-            const protocol = req.url.split(':')[0];
-            // console.log('Handling request:', req);
-            if (protocol === 'sprites') {
-              const dir = options.paths[protocol];
-              const file = unescape(req.url).substring(protocol.length + 3);
-              fs.readFile(path.join(dir, file), (err, data) => {
-                callback(err, { data: data });
-              });
-            } else if (protocol === 'fonts') {
-              const parts = req.url.split('/');
-              const fontstack = unescape(parts[2]);
-              const range = parts[3].split('.')[0];
-              getFontsPbf(
-                null,
-                options.paths[protocol],
-                fontstack,
-                range,
-                existingFonts,
-              ).then(
-                (concated) => {
-                  callback(null, { data: concated });
-                },
-                (err) => {
-                  callback(err, { data: null });
-                },
-              );
-            } else if (protocol === 'mbtiles') {
-              const parts = req.url.split('/');
-              const sourceId = parts[2];
-              const source = map.sources[sourceId];
-              const sourceInfo = styleJSON.sources[sourceId];
-              const z = parts[3] | 0;
-              const x = parts[4] | 0;
-              const y = parts[5].split('.')[0] | 0;
-              const format = parts[5].split('.')[1];
-              source.getTile(z, x, y, (err, data, headers) => {
-                if (err) {
-                  if (options.verbose)
-                    console.log('MBTiles error, serving empty', err);
+          mode,
+          ratio,
+          request: async (req, callback) => {
+            // MapLibre Native waits indefinitely for a resource whose callback
+            // never fires, wedging the renderer at 0% CPU until the render timeout
+            // recycles it. Guarantee exactly one call on every path, including throws.
+            let settled = false;
+            const respond = (err, response) => {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              callback(err, response);
+            };
+
+            try {
+              const protocol = req.url.split(':')[0];
+              if (verbose >= 3) {
+                console.log('Handling request:', req);
+              }
+              if (protocol === 'sprites') {
+                // eslint-disable-next-line security/detect-object-injection -- protocol is 'sprites', validated above
+                const dir = options.paths[protocol];
+                const file = decodeURIComponent(req.url).substring(
+                  protocol.length + 3,
+                );
+                readFile(path.join(dir, file))
+                  .then((data) => {
+                    respond(null, { data: data });
+                  })
+                  .catch((err) => {
+                    respond(err, null);
+                  });
+              } else if (protocol === 'fonts') {
+                const parts = req.url.split('/');
+                const fontstack = decodeURIComponent(parts[2]);
+                const range = parts[3].split('.')[0];
+
+                try {
+                  const concatenated = await getFontsPbf(
+                    null,
+                    // eslint-disable-next-line security/detect-object-injection -- protocol is 'fonts', validated above
+                    options.paths[protocol],
+                    fontstack,
+                    range,
+                    existingFonts,
+                  );
+                  respond(null, { data: concatenated });
+                } catch (err) {
+                  respond(err, { data: null });
+                }
+              } else if (protocol === 'mbtiles' || protocol === 'pmtiles') {
+                const parts = req.url.split('/');
+                const sourceId = parts[2];
+                // eslint-disable-next-line security/detect-object-injection -- sourceId from internal style source names
+                const source = map.sources[sourceId];
+                // eslint-disable-next-line security/detect-object-injection -- sourceId from internal style source names
+                const sourceType = map.sourceTypes[sourceId];
+                // eslint-disable-next-line security/detect-object-injection -- sourceId from internal style source names
+                const sourceInfo = styleJSON.sources[sourceId];
+
+                const z = parts[3] | 0;
+                const x = parts[4] | 0;
+                const y = parts[5].split('.')[0] | 0;
+                const format = parts[5].split('.')[1];
+
+                const fetchTile = await fetchTileData(
+                  source,
+                  sourceType,
+                  z,
+                  x,
+                  y,
+                );
+                if (fetchTile == null) {
+                  if (verbose >= 2) {
+                    console.log('fetchTile null on %s', req.url);
+                  }
+                  // eslint-disable-next-line security/detect-object-injection -- sourceId from internal style source names
+                  const sourceSparse = map.sparseFlags[sourceId];
+                  // Metadata was already folded into sparseFlags at load time.
+                  const sparse = resolveSparse({
+                    perSource: sourceSparse,
+                    globalOption: options.sparse,
+                    isVector: format === 'pbf',
+                  });
+                  // sparse=true -> return empty callback so MapLibre can overzoom
+                  if (sparse) {
+                    respond();
+                    return;
+                  }
+                  // sparse=false -> 204 (empty tile, no overzoom) - create blank response
                   createEmptyResponse(
                     sourceInfo.format,
                     sourceInfo.color,
-                    callback,
+                    respond,
                   );
                   return;
                 }
 
                 const response = {};
+                response.data = fetchTile.data;
+                let headers = fetchTile.headers;
+
                 if (headers['Last-Modified']) {
                   response.modified = new Date(headers['Last-Modified']);
                 }
 
                 if (format === 'pbf') {
-                  try {
-                    response.data = zlib.unzipSync(data);
-                  } catch (err) {
-                    console.log(
-                      'Skipping incorrect header for tile mbtiles://%s/%s/%s/%s.pbf',
-                      id,
-                      z,
-                      x,
-                      y,
-                    );
+                  let isGzipped =
+                    response.data
+                      .slice(0, 2)
+                      .indexOf(Buffer.from([0x1f, 0x8b])) === 0;
+                  if (isGzipped) {
+                    response.data = await gunzipP(response.data);
                   }
                   if (options.dataDecoratorFunc) {
-                    response.data = options.dataDecoratorFunc(
+                    response.data = await options.dataDecoratorFunc(
                       sourceId,
                       'data',
                       response.data,
@@ -1204,44 +1528,145 @@ export const serve_rendered = {
                       y,
                     );
                   }
-                } else {
-                  response.data = data;
                 }
 
-                callback(null, response);
-              });
-            } else if (protocol === 'http' || protocol === 'https') {
-              request(
-                {
-                  url: req.url,
-                  encoding: null,
-                  gzip: true,
-                },
-                (err, res, body) => {
-                  const parts = url.parse(req.url);
-                  const extension = path.extname(parts.pathname).toLowerCase();
-                  const format = extensionToFormat[extension] || '';
-                  if (err || res.statusCode < 200 || res.statusCode >= 300) {
-                    // console.log('HTTP error', err || res.statusCode);
-                    createEmptyResponse(format, '', callback);
+                respond(null, response);
+              } else if (protocol === 'http' || protocol === 'https') {
+                const controller = new AbortController();
+                const timeoutMs =
+                  (fetchTimeout && Number(fetchTimeout)) || 15000;
+                let timeoutId;
+
+                const extension = path
+                  .extname(url.parse(req.url).pathname)
+                  .toLowerCase();
+                // eslint-disable-next-line security/detect-object-injection -- extension is from path.extname, limited set
+                const format = extensionToFormat[extension] || '';
+                // A raw remote URL has neither per-source config nor metadata.
+                const sparse = resolveSparse({
+                  globalOption: options.sparse,
+                  isVector: extension === '.pbf',
+                });
+
+                try {
+                  timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+                  const response = await fetch(req.url, {
+                    signal: controller.signal,
+                  });
+                  clearTimeout(timeoutId);
+
+                  // HTTP 204 No Content means "empty tile" - generate a blank tile
+                  if (response.status === 204) {
+                    createEmptyResponse(format, '', respond);
                     return;
                   }
 
-                  const response = {};
-                  if (res.headers.modified) {
-                    response.modified = new Date(res.headers.modified);
-                  }
-                  if (res.headers.expires) {
-                    response.expires = new Date(res.headers.expires);
-                  }
-                  if (res.headers.etag) {
-                    response.etag = res.headers.etag;
+                  if (!response.ok) {
+                    if (verbose >= 2) {
+                      console.log(
+                        'fetchTile HTTP %d on %s, %s',
+                        response.status,
+                        req.url,
+                        sparse ? 'allowing overzoom' : 'creating empty tile',
+                      );
+                    }
+
+                    if (sparse) {
+                      // sparse=true -> allow overzoom
+                      respond();
+                      return;
+                    }
+
+                    // sparse=false -> create empty tile
+                    createEmptyResponse(format, '', respond);
+                    return;
                   }
 
-                  response.data = body;
-                  callback(null, response);
-                },
+                  const responseHeaders = response.headers;
+                  const responseData = await response.arrayBuffer();
+                  const parsedResponse = {};
+
+                  if (responseHeaders.get('last-modified')) {
+                    parsedResponse.modified = new Date(
+                      responseHeaders.get('last-modified'),
+                    );
+                  }
+                  if (responseHeaders.get('expires')) {
+                    parsedResponse.expires = new Date(
+                      responseHeaders.get('expires'),
+                    );
+                  }
+                  if (responseHeaders.get('etag')) {
+                    parsedResponse.etag = responseHeaders.get('etag');
+                  }
+
+                  parsedResponse.data = Buffer.from(responseData);
+                  respond(null, parsedResponse);
+                } catch (error) {
+                  // Log DNS failures
+                  if (error.cause?.code === 'ENOTFOUND') {
+                    console.error(
+                      `DNS RESOLUTION FAILED for ${req.url}. ` +
+                        `This domain may be unreachable or misconfigured in your style. ` +
+                        `Consider removing it or fixing the DNS.`,
+                    );
+                  }
+
+                  // Log timeout
+                  if (error.name === 'AbortError') {
+                    console.error(
+                      `FETCH TIMEOUT for ${req.url}. ` +
+                        `The request took longer than ${timeoutMs} ms to complete.`,
+                    );
+                  }
+
+                  // Log all other errors
+                  console.error(
+                    `Error fetching remote URL ${req.url}:`,
+                    error.message || error,
+                  );
+
+                  if (sparse) {
+                    // sparse=true -> allow overzoom
+                    respond();
+                    return;
+                  }
+
+                  // sparse=false -> create empty tile
+                  createEmptyResponse(format, '', respond);
+                }
+              } else if (protocol === 'file') {
+                const name = decodeURI(req.url).substring(protocol.length + 3);
+                const file = path.join(options.paths['files'], name);
+                if (await existsP(file)) {
+                  const inputFileStats = await fsp.stat(file);
+                  if (!inputFileStats.isFile() || inputFileStats.size === 0) {
+                    throw Error(
+                      `File is not valid: "${req.url}" - resolved to "${file}"`,
+                    );
+                  }
+
+                  readFile(file)
+                    .then((data) => {
+                      respond(null, { data: data });
+                    })
+                    .catch((err) => {
+                      respond(err, null);
+                    });
+                } else {
+                  throw Error(
+                    `File does not exist: "${req.url}" - resolved to "${file}"`,
+                  );
+                }
+              } else {
+                throw Error(`Unsupported protocol in request: "${req.url}"`);
+              }
+            } catch (err) {
+              console.error(
+                `Error handling renderer request for ${req.url}:`,
+                err,
               );
+              respond(err, null);
             }
           },
         });
@@ -1249,8 +1674,8 @@ export const serve_rendered = {
         createCallback(null, renderer);
       };
       return new advancedPool.Pool({
-        min: min,
-        max: max,
+        min,
+        max,
         create: createRenderer.bind(null, ratio),
         destroy: (renderer) => {
           renderer.release();
@@ -1260,34 +1685,59 @@ export const serve_rendered = {
 
     const styleFile = params.style;
     const styleJSONPath = path.resolve(options.paths.styles, styleFile);
-    try {
-      styleJSON = JSON.parse(fs.readFileSync(styleJSONPath));
-    } catch (e) {
-      console.log('Error parsing style file');
-      return false;
+
+    if (styleJSON.sprite) {
+      if (!Array.isArray(styleJSON.sprite)) {
+        styleJSON.sprite = [{ id: 'default', url: styleJSON.sprite }];
+      }
+      styleJSON.sprite.forEach((spriteItem) => {
+        // Sprites should only be HTTP/HTTPS, not S3
+        if (!isValidHttpUrl(spriteItem.url)) {
+          spriteItem.url =
+            'sprites://' +
+            spriteItem.url
+              .replace('{style}', path.basename(styleFile, '.json'))
+              .replace(
+                '{styleJsonFolder}',
+                path.relative(
+                  options.paths.sprites,
+                  path.dirname(styleJSONPath),
+                ),
+              );
+        }
+      });
     }
 
-    if (styleJSON.sprite && !httpTester.test(styleJSON.sprite)) {
-      styleJSON.sprite =
-        'sprites://' +
-        styleJSON.sprite
-          .replace('{style}', path.basename(styleFile, '.json'))
-          .replace(
-            '{styleJsonFolder}',
-            path.relative(options.paths.sprites, path.dirname(styleJSONPath)),
-          );
-    }
-    if (styleJSON.glyphs && !httpTester.test(styleJSON.glyphs)) {
+    // Glyphs should only be HTTP/HTTPS, not S3
+    if (styleJSON.glyphs && !isValidHttpUrl(styleJSON.glyphs)) {
       styleJSON.glyphs = `fonts://${styleJSON.glyphs}`;
     }
 
     for (const layer of styleJSON.layers || []) {
       if (layer && layer.paint) {
+        const layerIdForWarning = layer.id || 'unnamed-layer';
+
         // Remove (flatten) 3D buildings
         if (layer.paint['fill-extrusion-height']) {
+          if (verbose >= 1) {
+            console.warn(
+              `Warning: Layer '${layerIdForWarning}' in style '${id}' has property 'fill-extrusion-height'. ` +
+                `3D extrusion may appear distorted or misleading when rendered as a static image due to camera angle limitations. ` +
+                `It will be flattened (set to 0) in rendered images. ` +
+                `Note: This property will still work with MapLibre GL JS vector maps.`,
+            );
+          }
           layer.paint['fill-extrusion-height'] = 0;
         }
         if (layer.paint['fill-extrusion-base']) {
+          if (verbose >= 1) {
+            console.warn(
+              `Warning: Layer '${layerIdForWarning}' in style '${id}' has property 'fill-extrusion-base'. ` +
+                `3D extrusion may appear distorted or misleading when rendered as a static image due to camera angle limitations. ` +
+                `It will be flattened (set to 0) in rendered images. ` +
+                `Note: This property will still work with MapLibre GL JS vector maps.`,
+            );
+          }
           layer.paint['fill-extrusion-base'] = 0;
         }
       }
@@ -1304,6 +1754,9 @@ export const serve_rendered = {
       type: 'baselayer',
     };
     const attributionOverride = params.tilejson && params.tilejson.attribution;
+    if (styleJSON.center && styleJSON.zoom) {
+      tileJSON.center = styleJSON.center.concat(Math.round(styleJSON.zoom));
+    }
     Object.assign(tileJSON, params.tilejson || {});
     tileJSON.tiles = params.domains || options.domains;
     fixTileJSONCenter(tileJSON);
@@ -1315,121 +1768,393 @@ export const serve_rendered = {
       dataProjWGStoInternalWGS: null,
       lastModified: new Date().toUTCString(),
       watermark: params.watermark || options.watermark,
+      staticAttributionText:
+        params.staticAttributionText || options.staticAttributionText,
     };
+    // eslint-disable-next-line security/detect-object-injection -- id is from config file style names
     repo[id] = repoobj;
 
-    const queue = [];
     for (const name of Object.keys(styleJSON.sources)) {
+      let sourceType;
+      // eslint-disable-next-line security/detect-object-injection -- name is from style sources object keys
       let source = styleJSON.sources[name];
-      const url = source.url;
-
-      if (url && url.lastIndexOf('mbtiles:', 0) === 0) {
-        // found mbtiles source, replace with info from local file
+      let url = source.url;
+      if (
+        url &&
+        (url.startsWith('pmtiles://') || url.startsWith('mbtiles://'))
+      ) {
+        // found pmtiles or mbtiles source, replace with info from local file
         delete source.url;
 
-        let mbtilesFile = url.substring('mbtiles://'.length);
-        const fromData =
-          mbtilesFile[0] === '{' && mbtilesFile[mbtilesFile.length - 1] === '}';
+        let dataId = url.replace('pmtiles://', '').replace('mbtiles://', '');
+        if (dataId.startsWith('{') && dataId.endsWith('}')) {
+          dataId = dataId.slice(1, -1);
+        }
 
-        if (fromData) {
-          mbtilesFile = mbtilesFile.substr(1, mbtilesFile.length - 2);
-          const mapsTo = (params.mapping || {})[mbtilesFile];
-          if (mapsTo) {
-            mbtilesFile = mapsTo;
-          }
-          mbtilesFile = dataResolver(mbtilesFile);
-          if (!mbtilesFile) {
-            console.error(`ERROR: data "${mbtilesFile}" not found!`);
-            process.exit(1);
+        // eslint-disable-next-line security/detect-object-injection -- dataId is from style source URL, used for mapping lookup
+        const mapsTo = (params.mapping || {})[dataId];
+        if (mapsTo) {
+          dataId = mapsTo;
+        }
+
+        let inputFile;
+        let s3Profile;
+        let requestPayer;
+        let s3Region;
+        let s3UrlFormat;
+        const dataInfo = dataResolver(dataId);
+        if (dataInfo.inputFile) {
+          inputFile = dataInfo.inputFile;
+          sourceType = dataInfo.fileType;
+          s3Profile = dataInfo.s3Profile;
+          requestPayer = dataInfo.requestPayer;
+          s3Region = dataInfo.s3Region;
+          s3UrlFormat = dataInfo.s3UrlFormat;
+        } else {
+          console.error(`ERROR: data "${inputFile}" not found!`);
+          process.exit(1);
+        }
+
+        // PMTiles supports remote URLs (HTTP and S3), skip file check for those
+        if (!isValidRemoteUrl(inputFile)) {
+          const inputFileStats = await fsp.stat(inputFile);
+          if (!inputFileStats.isFile() || inputFileStats.size === 0) {
+            throw Error(`Not valid PMTiles file: "${inputFile}"`);
           }
         }
 
-        queue.push(
-          new Promise((resolve, reject) => {
-            mbtilesFile = path.resolve(options.paths.mbtiles, mbtilesFile);
-            const mbtilesFileStats = fs.statSync(mbtilesFile);
-            if (!mbtilesFileStats.isFile() || mbtilesFileStats.size === 0) {
-              throw Error(`Not valid MBTiles file: ${mbtilesFile}`);
+        if (sourceType === 'pmtiles') {
+          // eslint-disable-next-line security/detect-object-injection -- name is from style sources object keys
+          map.sources[name] = openPMtiles(
+            inputFile,
+            s3Profile,
+            requestPayer,
+            s3Region,
+            s3UrlFormat,
+            verbose,
+          );
+          // eslint-disable-next-line security/detect-object-injection -- name is from style sources object keys
+          map.sourceTypes[name] = 'pmtiles';
+          // eslint-disable-next-line security/detect-object-injection -- name is from style sources object keys
+          const metadata = await getPMtilesInfo(map.sources[name], inputFile);
+
+          if (!repoobj.dataProjWGStoInternalWGS && metadata.proj4) {
+            // how to do this for multiple sources with different proj4 defs?
+            const to3857 = proj4('EPSG:3857');
+            const toDataProj = proj4(metadata.proj4);
+            repoobj.dataProjWGStoInternalWGS = (xy) =>
+              to3857.inverse(toDataProj.forward(xy));
+          }
+
+          const type = source.type;
+          Object.assign(source, metadata);
+          source.type = type;
+          source.tiles = [
+            // meta url which will be detected when requested
+            `pmtiles://${name}/{z}/{x}/{y}.${metadata.format || 'pbf'}`,
+          ];
+          delete source.scheme;
+          // Object.assign copied the archive metadata onto the style source, so
+          // `sparse` is sitting there unparsed - "false" as a string is truthy.
+          // sparseFlags below is the value the request handler reads, so drop
+          // the duplicate here, before the data decorator sees it.
+          delete source.sparse;
+
+          if (options.dataDecoratorFunc) {
+            source = await options.dataDecoratorFunc(name, 'tilejson', source);
+            // eslint-disable-next-line security/detect-object-injection -- name is from style sources object keys
+            styleJSON.sources[name] = source;
+          }
+
+          if (
+            !attributionOverride &&
+            source.attribution &&
+            source.attribution.length > 0
+          ) {
+            if (!tileJSON.attribution.includes(source.attribution)) {
+              if (tileJSON.attribution.length > 0) {
+                tileJSON.attribution += ' | ';
+              }
+              tileJSON.attribution += source.attribution;
             }
-            map.sources[name] = new MBTiles(mbtilesFile + '?mode=ro', (err) => {
-              map.sources[name].getInfo((err, info) => {
-                if (err) {
-                  console.error(err);
-                  return;
-                }
+          }
 
-                if (!repoobj.dataProjWGStoInternalWGS && info.proj4) {
-                  // how to do this for multiple sources with different proj4 defs?
-                  const to3857 = proj4('EPSG:3857');
-                  const toDataProj = proj4(info.proj4);
-                  repoobj.dataProjWGStoInternalWGS = (xy) =>
-                    to3857.inverse(toDataProj.forward(xy));
-                }
+          // eslint-disable-next-line security/detect-object-injection -- name is from style sources object keys
+          map.sparseFlags[name] = resolveSparse({
+            perSource: dataInfo.sparse,
+            globalOption: options.sparse,
+            metadata: parseOptionalBoolean(metadata.sparse),
+            isVector: metadata.format === 'pbf',
+          });
+        } else {
+          // MBTiles does not support remote URLs
 
-                const type = source.type;
-                Object.assign(source, info);
-                source.type = type;
-                source.tiles = [
-                  // meta url which will be detected when requested
-                  `mbtiles://${name}/{z}/{x}/{y}.${info.format || 'pbf'}`,
-                ];
-                delete source.scheme;
+          const inputFileStats = await fsp.stat(inputFile);
+          if (!inputFileStats.isFile() || inputFileStats.size === 0) {
+            throw Error(`Not valid MBTiles file: "${inputFile}"`);
+          }
+          const mbw = await openMbTilesWrapper(inputFile);
+          const info = await mbw.getInfo();
+          // eslint-disable-next-line security/detect-object-injection -- name is from style sources object keys
+          map.sources[name] = mbw.getMbTiles();
+          // eslint-disable-next-line security/detect-object-injection -- name is from style sources object keys
+          map.sourceTypes[name] = 'mbtiles';
 
-                if (options.dataDecoratorFunc) {
-                  source = options.dataDecoratorFunc(name, 'tilejson', source);
-                }
+          if (!repoobj.dataProjWGStoInternalWGS && info.proj4) {
+            // how to do this for multiple sources with different proj4 defs?
+            const to3857 = proj4('EPSG:3857');
+            const toDataProj = proj4(info.proj4);
+            repoobj.dataProjWGStoInternalWGS = (xy) =>
+              to3857.inverse(toDataProj.forward(xy));
+          }
 
-                if (
-                  !attributionOverride &&
-                  source.attribution &&
-                  source.attribution.length > 0
-                ) {
-                  if (!tileJSON.attribution.includes(source.attribution)) {
-                    if (tileJSON.attribution.length > 0) {
-                      tileJSON.attribution += ' | ';
-                    }
-                    tileJSON.attribution += source.attribution;
-                  }
-                }
-                resolve();
-              });
-            });
-          }),
-        );
+          const type = source.type;
+          Object.assign(source, info);
+          source.type = type;
+          source.tiles = [
+            // meta url which will be detected when requested
+            `mbtiles://${name}/{z}/{x}/{y}.${info.format || 'pbf'}`,
+          ];
+          delete source.scheme;
+          // Object.assign copied the archive metadata onto the style source, so
+          // `sparse` is sitting there unparsed - "false" as a string is truthy.
+          // sparseFlags below is the value the request handler reads, so drop
+          // the duplicate here, before the data decorator sees it.
+          delete source.sparse;
+
+          if (options.dataDecoratorFunc) {
+            source = await options.dataDecoratorFunc(name, 'tilejson', source);
+            // eslint-disable-next-line security/detect-object-injection -- name is from style sources object keys
+            styleJSON.sources[name] = source;
+          }
+
+          if (
+            !attributionOverride &&
+            source.attribution &&
+            source.attribution.length > 0
+          ) {
+            if (!tileJSON.attribution.includes(source.attribution)) {
+              if (tileJSON.attribution.length > 0) {
+                tileJSON.attribution += ' | ';
+              }
+              tileJSON.attribution += source.attribution;
+            }
+          }
+
+          // eslint-disable-next-line security/detect-object-injection -- name is from style sources object keys
+          map.sparseFlags[name] = resolveSparse({
+            perSource: dataInfo.sparse,
+            globalOption: options.sparse,
+            metadata: parseOptionalBoolean(info.sparse),
+            isVector: info.format === 'pbf',
+          });
+        }
       }
     }
 
-    const renderersReadyPromise = Promise.all(queue).then(() => {
-      // standard and @2x tiles are much more usual -> default to larger pools
-      const minPoolSizes = options.minRendererPoolSizes || [8, 4, 2];
-      const maxPoolSizes = options.maxRendererPoolSizes || [16, 8, 4];
-      for (let s = 1; s <= maxScaleFactor; s++) {
-        const i = Math.min(minPoolSizes.length - 1, s - 1);
-        const j = Math.min(maxPoolSizes.length - 1, s - 1);
-        const minPoolSize = minPoolSizes[i];
-        const maxPoolSize = Math.max(minPoolSize, maxPoolSizes[j]);
-        map.renderers[s] = createPool(s, 'tile', minPoolSize, maxPoolSize);
-        map.renderers_static[s] = createPool(
-          s,
-          'static',
-          minPoolSize,
-          maxPoolSize,
-        );
-      }
-    });
+    // standard and @2x tiles are much more usual -> default to larger pools
+    const minPoolSizes = options.minRendererPoolSizes || [8, 4, 2];
+    const maxPoolSizes = options.maxRendererPoolSizes || [16, 8, 4];
+    for (let s = 1; s <= maxScaleFactor; s++) {
+      const i = Math.min(minPoolSizes.length - 1, s - 1);
+      const j = Math.min(maxPoolSizes.length - 1, s - 1);
+      // eslint-disable-next-line security/detect-object-injection -- i and j are calculated indices bounded by array length
+      const minPoolSize = minPoolSizes[i];
+      // eslint-disable-next-line security/detect-object-injection -- i and j are calculated indices bounded by array length
+      const maxPoolSize = Math.max(minPoolSize, maxPoolSizes[j]);
+      // eslint-disable-next-line security/detect-object-injection -- s is loop counter from 1 to maxScaleFactor
+      map.renderers[s] = createPool(s, 'tile', minPoolSize, maxPoolSize);
+      // eslint-disable-next-line security/detect-object-injection -- s is loop counter from 1 to maxScaleFactor
+      map.renderersStatic[s] = createPool(
+        s,
+        'static',
+        minPoolSize,
+        maxPoolSize,
+      );
+    }
 
-    return Promise.all([renderersReadyPromise]);
+    if (metricsModule) {
+      map._metricsInterval = setInterval(() => {
+        [map.renderers, map.renderersStatic].forEach((poolArr) => {
+          poolArr.forEach((pool) => {
+            if (!pool) return;
+            try {
+              const total = pool.size ?? 0;
+              const available = pool.available ?? 0;
+              metricsModule.renderPoolSize.set({ name: id }, total);
+              metricsModule.renderPoolActive.set(
+                { name: id },
+                total - available,
+              );
+              metricsModule.renderPoolWaiting.set(
+                { name: id },
+                pool.pending ?? 0,
+              );
+            } catch (_) {
+              /* pool may be mid-teardown */
+            }
+          });
+        });
+      }, 5000);
+    }
   },
-  remove: (repo, id) => {
+  /**
+   * Removes an item from the repository.
+   * @param {object} repo Repository object.
+   * @param {string} id ID of the item to remove.
+   * @returns {void}
+   */
+  remove: function (repo, id) {
+    // eslint-disable-next-line security/detect-object-injection -- id is function parameter for removal
     const item = repo[id];
     if (item) {
+      if (item.map._metricsInterval) {
+        clearInterval(item.map._metricsInterval);
+      }
+      Object.keys(item.map.sources || {}).forEach((sourceId) => {
+        // eslint-disable-next-line security/detect-object-injection -- sourceId is from Object.keys() iteration
+        const source = item.map.sources[sourceId];
+        // eslint-disable-next-line security/detect-object-injection -- sourceId is from Object.keys() iteration
+        const sourceType = item.map.sourceTypes[sourceId];
+        if (
+          sourceType === 'mbtiles' &&
+          source &&
+          typeof source.close === 'function'
+        ) {
+          source.close((err) => {
+            if (err) {
+              console.warn('Failed to close MBTiles source:', err);
+            }
+          });
+        }
+      });
       item.map.renderers.forEach((pool) => {
         pool.close();
       });
-      item.map.renderers_static.forEach((pool) => {
+      item.map.renderersStatic.forEach((pool) => {
         pool.close();
       });
     }
+    // eslint-disable-next-line security/detect-object-injection -- id is function parameter for removal
     delete repo[id];
+  },
+  /**
+   * Removes all items from the repository and closes owned local data sources.
+   * @param {object} repo Repository object.
+   * @returns {Promise<void>}
+   */
+  clear: async function (repo) {
+    await Promise.all(
+      Object.keys(repo).map(async (id) => {
+        // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys() iteration
+        const item = repo[id];
+        try {
+          if (!item) {
+            return;
+          }
+
+          await Promise.all(
+            Object.keys(item.map.sources || {}).map(async (sourceId) => {
+              // eslint-disable-next-line security/detect-object-injection -- sourceId is from Object.keys() iteration
+              const source = item.map.sources[sourceId];
+              // eslint-disable-next-line security/detect-object-injection -- sourceId is from Object.keys() iteration
+              const sourceType = item.map.sourceTypes[sourceId];
+              if (
+                sourceType === 'mbtiles' &&
+                source &&
+                typeof source.close === 'function'
+              ) {
+                await new Promise((resolve) => {
+                  source.close((err) => {
+                    if (err) {
+                      console.warn(
+                        `Failed to close MBTiles source "${sourceId}" while clearing rendered repo entry "${id}":`,
+                        err,
+                      );
+                    }
+                    resolve();
+                  });
+                });
+              }
+            }),
+          );
+          item.map.renderers.forEach((pool) => {
+            pool.close();
+          });
+          item.map.renderersStatic.forEach((pool) => {
+            pool.close();
+          });
+        } catch (err) {
+          console.warn(`Failed to clear rendered repo entry "${id}":`, err);
+        } finally {
+          // eslint-disable-next-line security/detect-object-injection -- id is from Object.keys() iteration
+          delete repo[id];
+        }
+      }),
+    );
+  },
+
+  /**
+   * Gets multiple elevation values from a single decoded tile image.
+   * @param {Buffer} data - Raw tile image data
+   * @param {object} param - Parameters object containing encoding, format, and tile_size
+   * @param {Array<{pixelX: number, pixelY: number, index: number}>} pixels - Array of pixel coordinates to sample
+   * @returns {Promise<Array<{index: number, elevation: number}>>} Promise resolving to array of elevation results
+   */
+  getBatchElevationsFromTile: async function (data, param, pixels) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => {
+        try {
+          const canvas = createCanvas(param.tile_size, param.tile_size);
+          const context = canvas.getContext('2d');
+          context.drawImage(image, 0, 0);
+
+          const results = [];
+          for (const pixel of pixels) {
+            const { pixelX, pixelY, index } = pixel;
+            if (
+              pixelX < 0 ||
+              pixelY < 0 ||
+              pixelX >= param.tile_size ||
+              pixelY >= param.tile_size
+            ) {
+              results.push({ index, elevation: null });
+              continue;
+            }
+            const imgdata = context.getImageData(pixelX, pixelY, 1, 1);
+            const red = imgdata.data[0];
+            const green = imgdata.data[1];
+            const blue = imgdata.data[2];
+            let elevation;
+            if (param.encoding === 'mapbox') {
+              elevation = -10000 + (red * 256 * 256 + green * 256 + blue) * 0.1;
+            } else if (param.encoding === 'terrarium') {
+              elevation = red * 256 + green + blue / 256 - 32768;
+            } else {
+              elevation = null;
+            }
+            results.push({ index, elevation });
+          }
+          resolve(results);
+        } catch (error) {
+          reject(error);
+        }
+      };
+      image.onerror = (err) => reject(err);
+
+      (async () => {
+        try {
+          if (param.format === 'webp') {
+            const img = await sharp(data).toFormat('png').toBuffer();
+            image.src = `data:image/png;base64,${img.toString('base64')}`;
+          } else {
+            image.src = data;
+          }
+        } catch (err) {
+          reject(err);
+        }
+      })();
+    });
   },
 };
